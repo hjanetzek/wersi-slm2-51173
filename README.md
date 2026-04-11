@@ -15,16 +15,8 @@ To edit the bit markings, simply open `rom10x.bmp` in [Mask ROM
 Tool](https://github.com/travisgoodspeed/maskromtool/).  `make
 rom10x.txt` will produce an ASCII art of the bits in physical order.
 
-We don't yet know the proper decoding into physically ordered bytes,
-but it's possible that the
-[GatoROM](https://github.com/travisgoodspeed/maskromtool/blob/master/GATOREADME.md)
-program can solve the ordering or be extended to support it.  It's
-also possible that GatoROM and MaskRomTool will need to be extended
-with support for Z8's format.
-
-If you figure out the bit ordering, or if you happen to have
-implemented the electronic backdoor method of dumping the ROM, please
-get in touch.
+`make clean rom10x.bin` will produce a binary file.  It has some bit errors,
+but we are working to correct them in [this issue](https://github.com/travisgoodspeed/wersi-slm2-51173/issues/2).
 
 Happy hunting,
 
