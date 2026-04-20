@@ -137,10 +137,10 @@ LABELS = {
     0x0C25: (".store_state", None),
     0x0C41: ("op_lfsr_mul_1617", "LFSR step + multiply → reg[$16:$17]"),
     0x0C73: ("op_lfsr_mul_1415", "LFSR step + multiply → reg[$14:$15]"),
-    0x0CA5: ("finalize_output", "Finalize: ACC clamp + 12x16 multiply + envelope + pitch output"),
+    0x0CA5: ("finalize_output", "Finalize: ACC clamp + 12x12 unsigned multiply + pitch envelope + pitch output"),
     0x0CCA: ("finalize_output.entry", None),  # INC $1B then fall through (from opcode handlers)
-    0x0CCC: ("finalize_output.multiply", None),  # 12x16 multiply: R10:R11 = ACC × coeff
-    0x0D63: ("finalize.pitch_acc_positive", None),  # ACC was positive (no carry from multiply bit 11)
+    0x0CCC: ("finalize_output.multiply", None),  # 12×12 unsigned multiply: R10:R11 = ACC[11:0] × COEFF[11:0]
+    0x0D63: ("finalize.pitch_apply", None),  # normal path: 12×12 multiply result fits in 16 bits
     0x0DBD: (".mul_exsla_bit0", None),
     0x0DCB: (".mul_exsla_bit1", None),
     0x0DD9: (".modulation_dir_check", None),
@@ -162,16 +162,16 @@ LABELS = {
     0x0D3C: (".mul_bit9", None),
     0x0D48: (".mul_bit10", None),
     0x0D54: (".mul_bit11", None),      # last iteration — adds ACC at weight 1.0 (no final shift)
-    0x0D60: (".acc_sign_check", None),  # carry = ACC sign test (not magnitude overflow)
-    0x0ECF: ("finalize.pitch_acc_negative", "ACC was negative (carry from multiply bit 11 + large unsigned ACC)"),
+    0x0D60: (".mul_overflow_check", None),  # carry = genuine overflow (result > 16 bits)
+    0x0ECF: ("finalize.pitch_overflow", "Overflow path: result > 16 bits. Halve + re-apply PITCH_ENV. Should rarely fire with correct ACC base"),
     0x0F2D: (".mul_exsla_bit0", None),
     0x0F3B: (".mul_exsla_bit1", None),
     0x0F49: (".modulation_dir_check", None),
     0x0F6B: (".overflow_shift_check", None),
     0x0F6D: (".overflow_shift_check_i", None),
     0x0F72: (".overflow_shift_check_ii", None),
-    0x0F7B: ("finalize_output.check_underflow_ld_r12_r10", None),  # JP Z from pitch_acc_positive when reg[$1A]=0
-    0x0F80: ("finalize_output.overflow_shift", None),  # JP C from pitch_acc_positive add path
+    0x0F7B: ("finalize_output.check_underflow_ld_r12_r10", None),  # JP Z from pitch_apply when reg[$1A]=0
+    0x0F80: ("finalize_output.overflow_shift", None),  # JP C from pitch_apply add path
     0x0F92: ("finalize_output.underflow_shift", "Normalize underflow: shift R12:R11 left until R12 >= $1E"),
     # Internal branch targets (no section headers, just labels)
     0x0041: (".micro_lookup_overflow", None),
@@ -193,7 +193,7 @@ LABELS = {
     0x03E9: (".load_micro_program", None),  # common: load micro-program via LDEI sled
     0x0BF4: (".coeff_exit", None),
     # finalize_output subsystem: finalize_output → finalize_check → multiply_12x16
-    # → pitch_acc_positive → check_underflow are one logical flow. Internal targets:
+    # → pitch_apply → check_underflow are one logical flow. Internal targets:
     0x0CB6: (".finalize_sub43_check", None),
     0x0CBD: (".finalize_check", None),
     0x0CC1: (".finalize_clamp_max", None),  # LD R8, #$FF; LD R9, #$FF
@@ -528,18 +528,18 @@ ADDR_COMMENTS = {
     0x0CA5: "called by micro_program_interpreter",
         # overflow_shift
     0x0CCC: [
-        "12x16 fixed-point multiply",
-        "Formula: R10:R11 = R8:R9 * COEFF / 2048",
-        "COEFF is 1.11 fixed-point (1 integer bit, 11 fractional bits):",
+        "12x12 unsigned fixed-point multiply.",
+        "Formula: R10:R11 = ACC[11:0] * COEFF[11:0] / 2048",
+        "ACC is unsigned 12-bit: {R8[7:0], R9[7:4]} (low nibble of R9 always 0).",
+        "COEFF is 1.11 fixed-point: {PITCH_HI[3:0], PITCH_LO[7:0]}.",
         "  bit 11 (PITCH_HI bit 3) = integer bit (weight x1.0)",
-        "  bits 10:0 = fractional (weight x0.0 to x0.999)",
-        "  Range: 0.0 to ~2.0.  Unity (x1.0) at COEFF=$800",
-        "PITCH_HI[5:4] = EXSLA staging (not used by multiply)",
-        "PITCH_HI[7:6] = EXSLA bits (used by pitch_acc_positive AFTER multiply)",
-        "12 unrolled iterations: 8 from PITCH_LO + 4 from PITCH_HI[3:0]",
-        "NOTE: no final RRC after last iteration -> bit 11 has weight 1.0",
-        "When COEFF > $800 (multiplier > 1.0): result can exceed ACC",
-        "  -> carry after last ADC -> JP C, overflow",
+        "  bits 10:0 = fractional.  Range: 0.0 to ~2.0. Unity at COEFF=$800.",
+        "PITCH_HI[5:4] = EXSLA staging (not used by multiply).",
+        "PITCH_HI[7:6] = EXSLA bits (used by pitch_apply AFTER multiply).",
+        "12 unrolled iterations: 8 from PITCH_LO + 4 from PITCH_HI[3:0].",
+        "NOTE: no final RRC after bit 11 iteration -> bit 11 has weight 1.0.",
+        "Carry after bit 11 = genuine overflow (result > 16 bits) -> pitch_overflow.",
+        "With correct ACC base (~$8000), overflow should rarely fire.",
     ],
     0x0CCE: "R13=PITCH_LO",
     0x0CD0: "clear result accumulator R10:R11",
@@ -558,21 +558,21 @@ ADDR_COMMENTS = {
     0x0D58: [
         "Coeff bit 11 = PITCH_HI bit 3 (integer bit, weight 1.0).",
         "Last iteration: adds ACC at FULL weight (no final RRC shift).",
-        "When bit 11=1, carry from ADC is an ACC SIGN TEST:",
-        "  ACC positive (< $8000): partial + ACC fits → carry=0 → pitch_acc_positive",
-        "  ACC negative (>= $8000): partial + large unsigned → carry=1 → pitch_acc_negative",
-        "Bit 11 must be 1 for sign detection to work. If 0, carry is random.",
+        "With bit 11 set: result ≈ ACC × (1 + fraction). Can overflow if ACC is large.",
+        "With bit 11 clear: result = ACC × fraction (< ACC). Never overflows.",
+        "Carry from ADC = genuine overflow (result > 16 bits), NOT a sign test.",
+        "With correct ACC base ($8000 ± noise), overflow should rarely fire.",
     ],
-    0x0D5A: "bit 11 clear → skip ADD, carry from previous RRC (unreliable)",
+    0x0D5A: "bit 11 clear → skip ADD, carry from previous RRC (not meaningful)",
     0x0D5C: "bit 11 set → add ACC at weight 1.0 (result ≈ ACC × (1 + fraction))",
-    0x0D60: "carry = ACC sign: positive → pitch_acc_positive, negative → pitch_acc_negative",
+    0x0D60: "carry = overflow: result > 16 bits → pitch_overflow (halve + re-apply)",
     0x0D66: "LD R12, R10 - returns to finalize_output.check_underflow",
     0x0D75: "skip bit0 envelope direction handled at 0xDD9",
     0x0DEA: "returns to pitch_output",
     0x0DF5: "returns to pitch_output[.underflow_shift_entry]",
     # pitch_output: compute fractional dither + R13 table index
     0x0DF8: [
-        "Paths from finalize.envelope and finalize.pitch_acc_negative join here"
+        "Paths from finalize.envelope and finalize.pitch_overflow join here"
         "pitch_output: prepare synthesis_output parameters",
         "Inputs: R12 = multiply result high (magnitude), R11 = low byte",
         "        R13 = sub mode (from check_underflow/normalize/overflow)",
@@ -721,7 +721,7 @@ ADDR_COMMENTS = {
     0x0E04: "R11 = ROM[$0232+i] = fractional dither pattern (0-7 of 8 bits set)",
     0x0E06: [
         "8th RR restores PITCH_ENV to original value after",
-        "7 RR's in pitch_acc_positive/overflow multiply. Needed when ECLK is",
+        "7 RR's in pitch_apply/overflow multiply. Needed when ECLK is",
         "already pending or bus not free (PITCH_ENV not refreshed from Port 1).",
         "Also entry from underflow_shift cap (R12=$1E, R11=0 = no dither).",
     ],
@@ -1622,7 +1622,7 @@ def export_callgraph(rom, output_path):
                                 "mode_a_sub_gt9", "mode_a_sub9", "mode_a_sub_lt9"},
             "Synthesis Pipeline": {"synthesis_output", "micro_program_interpreter",
                                    "finalize_output", "finalize_multiply_entry",
-                                   "pitch_acc_positive", "pitch_acc_negative",
+                                   "pitch_apply", "pitch_overflow",
                                    "check_underflow", "dac_output_setup",
                                    "synthesis_loop_entry", "synthesis_loop_reentry",
                                    "synthesis_output_common",
@@ -1667,7 +1667,7 @@ def export_callgraph(rom, output_path):
         irq_nodes = {"irq3_handler", "irq4_handler", "irq1_handler", "init"}
         pipeline_nodes = {"synthesis_output", "micro_program_interpreter",
                           "finalize_output", "finalize_multiply_entry",
-                          "pitch_acc_positive", "pitch_acc_negative",
+                          "pitch_apply", "pitch_overflow",
                           "check_underflow", "dac_output_setup",
                           "synthesis_loop_entry", "synthesis_loop_reentry",
                           "interpreter_reentry"}

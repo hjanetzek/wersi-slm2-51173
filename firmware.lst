@@ -515,7 +515,7 @@
   515/ 23A :                            ; === RESET / INITIALIZATION ($023A) ===
   516/ 23A :                            ; ============================================================
   517/ 23A :                                    ORG     023Ah
-  518/ 23A :                            init:                                ; 2 refs
+  518/ 23A :                            init:                                ; 4 refs
   519/ 23A : B0 FC                              CLR     0FCh                            ; 0FC=FLAGS (flags register)
   520/ 23C :                            init_srp:                                ; 1 refs
   521/ 23C : 31 00                              SRP     #00h
@@ -2035,7 +2035,7 @@
  2035/ CA2 : 8D 05 8C                           JP      interpreter_reentry
  2036/ CA5 :                            
  2037/ CA5 :                            ; ============================================================
- 2038/ CA5 :                            ; === Finalize: ACC clamp + 12x16 multiply + envelope + pitch output ($0CA5) ===
+ 2038/ CA5 :                            ; === Finalize: ACC clamp + 12x12 unsigned multiply + pitch envelope + pitch output ($0CA5) ===
  2039/ CA5 :                            ; ============================================================
  2040/ CA5 :                                    ORG     0CA5h
  2041/ CA5 :                            finalize_output:                                ; 1 refs
@@ -2063,19 +2063,19 @@
  2063/ CC8 : 8B 02                              JR      finalize_output.multiply
  2064/ CCA :                            finalize_output.entry:                                ; 20 refs
  2065/ CCA : 20 1B                              INC     PROG_CTR
- 2066/ CCC :                            finalize_output.multiply:                                ; 13 refs
- 2067/ CCC :                            ; 12x16 fixed-point multiply
- 2068/ CCC :                            ; Formula: R10:R11 = R8:R9 * COEFF / 2048
- 2069/ CCC :                            ; COEFF is 1.11 fixed-point (1 integer bit, 11 fractional bits):
- 2070/ CCC :                            ;   bit 11 (PITCH_HI bit 3) = integer bit (weight x1.0)
- 2071/ CCC :                            ;   bits 10:0 = fractional (weight x0.0 to x0.999)
- 2072/ CCC :                            ;   Range: 0.0 to ~2.0.  Unity (x1.0) at COEFF=$800
- 2073/ CCC :                            ; PITCH_HI[5:4] = EXSLA staging (not used by multiply)
- 2074/ CCC :                            ; PITCH_HI[7:6] = EXSLA bits (used by pitch_acc_positive AFTER multiply)
- 2075/ CCC :                            ; 12 unrolled iterations: 8 from PITCH_LO + 4 from PITCH_HI[3:0]
- 2076/ CCC :                            ; NOTE: no final RRC after last iteration -> bit 11 has weight 1.0
- 2077/ CCC :                            ; When COEFF > $800 (multiplier > 1.0): result can exceed ACC
- 2078/ CCC :                            ;   -> carry after last ADC -> JP C, overflow
+ 2066/ CCC :                            finalize_output.multiply:                                ; 12 refs
+ 2067/ CCC :                            ; 12x12 unsigned fixed-point multiply.
+ 2068/ CCC :                            ; Formula: R10:R11 = ACC[11:0] * COEFF[11:0] / 2048
+ 2069/ CCC :                            ; ACC is unsigned 12-bit: {R8[7:0], R9[7:4]} (low nibble of R9 always 0).
+ 2070/ CCC :                            ; COEFF is 1.11 fixed-point: {PITCH_HI[3:0], PITCH_LO[7:0]}.
+ 2071/ CCC :                            ;   bit 11 (PITCH_HI bit 3) = integer bit (weight x1.0)
+ 2072/ CCC :                            ;   bits 10:0 = fractional.  Range: 0.0 to ~2.0. Unity at COEFF=$800.
+ 2073/ CCC :                            ; PITCH_HI[5:4] = EXSLA staging (not used by multiply).
+ 2074/ CCC :                            ; PITCH_HI[7:6] = EXSLA bits (used by pitch_apply AFTER multiply).
+ 2075/ CCC :                            ; 12 unrolled iterations: 8 from PITCH_LO + 4 from PITCH_HI[3:0].
+ 2076/ CCC :                            ; NOTE: no final RRC after bit 11 iteration -> bit 11 has weight 1.0.
+ 2077/ CCC :                            ; Carry after bit 11 = genuine overflow (result > 16 bits) -> pitch_overflow.
+ 2078/ CCC :                            ; With correct ACC base (~$8000), overflow should rarely fire.
  2079/ CCC : C8 12                              LD      R12, PITCH_HI
  2080/ CCE : D8 13                              LD      R13, PITCH_LO                   ; R13=PITCH_LO
  2081/ CD0 : B0 EA                              CLR     R10                             ; clear result accumulator R10:R11
@@ -2159,17 +2159,17 @@
  2159/ D56 : C0 EB                              RRC     R11
  2160/ D58 :                            ; Coeff bit 11 = PITCH_HI bit 3 (integer bit, weight 1.0).
  2161/ D58 :                            ; Last iteration: adds ACC at FULL weight (no final RRC shift).
- 2162/ D58 :                            ; When bit 11=1, carry from ADC is an ACC SIGN TEST:
- 2163/ D58 :                            ;   ACC positive (< $8000): partial + ACC fits → carry=0 → pitch_acc_positive
- 2164/ D58 :                            ;   ACC negative (>= $8000): partial + large unsigned → carry=1 → pitch_acc_negative
- 2165/ D58 :                            ; Bit 11 must be 1 for sign detection to work. If 0, carry is random.
+ 2162/ D58 :                            ; With bit 11 set: result ≈ ACC × (1 + fraction). Can overflow if ACC is large.
+ 2163/ D58 :                            ; With bit 11 clear: result = ACC × fraction (< ACC). Never overflows.
+ 2164/ D58 :                            ; Carry from ADC = genuine overflow (result > 16 bits), NOT a sign test.
+ 2165/ D58 :                            ; With correct ACC base ($8000 ± noise), overflow should rarely fire.
  2166/ D58 : E0 EC                              RR      R12
- 2167/ D5A : FB 04                              JR      NC, .acc_sign_check             ; bit 11 clear → skip ADD, carry from previous RRC (unreliable)
+ 2167/ D5A : FB 04                              JR      NC, .mul_overflow_check         ; bit 11 clear → skip ADD, carry from previous RRC (not meaningful)
  2168/ D5C : 02 B9                              ADD     R11, ACC_LO                     ; bit 11 set → add ACC at weight 1.0 (result ≈ ACC × (1 + fraction))
  2169/ D5E : 12 A8                              ADC     R10, ACC_HI
- 2170/ D60 :                            .acc_sign_check:                                ; 1 refs
- 2171/ D60 : 8D 0F B2                           JP      L_0FB2                          ; carry = ACC sign: positive → pitch_acc_positive, negative → pitch_acc_negative
- 2172/ D63 :                            finalize.pitch_acc_positive:                                ; 1 refs
+ 2170/ D60 :                            .mul_overflow_check:                                ; 1 refs
+ 2171/ D60 : 7D 0E CF                           JP      C, finalize.pitch_overflow      ; carry = overflow: result > 16 bits → pitch_overflow (halve + re-apply)
+ 2172/ D63 :                            finalize.pitch_apply:
  2173/ D63 : A4 E4 1A                           CP      PITCH_ENV, ZERO
  2174/ D66 : 6D 0F 7B                           JP      Z, finalize_output.check_underflow_ld_r12_r10; LD R12, R10 - returns to finalize_output.check_underflow
  2175/ D69 : B0 EC                              CLR     R12
@@ -2178,7 +2178,7 @@
  2178/ D6F : FB 04                              JR      NC, .L_0D75
  2179/ D71 : 02 DB                              ADD     R13, R11
  2180/ D73 : 12 CA                              ADC     R12, R10
- 2181/ D75 :                            .L_0D75:                                ; called from: finalize.pitch_acc_positive($0D6F)
+ 2181/ D75 :                            .L_0D75:                                ; called from: finalize.pitch_apply($0D6F)
  2182/ D75 : C0 EC                              RRC     R12                             ; skip bit0 envelope direction handled at 0xDD9
  2183/ D77 : C0 ED                              RRC     R13
  2184/ D79 : E0 1A                              RR      PITCH_ENV
@@ -2253,7 +2253,7 @@
  2253/ DF2 : A6 EC 1E                           CP      R12, #1Eh
  2254/ DF5 : 7D 0F 92                           JP      C, finalize_output.underflow_shift; returns to pitch_output[.underflow_shift_entry]
  2255/ DF8 :                            finalize_output.pitch_output:                                ; 6 refs
- 2256/ DF8 :                            ; Paths from finalize.envelope and finalize.pitch_acc_negative join herepitch_output: prepare synthesis_output parameters
+ 2256/ DF8 :                            ; Paths from finalize.envelope and finalize.pitch_overflow join herepitch_output: prepare synthesis_output parameters
  2257/ DF8 :                            ; Inputs: R12 = multiply result high (magnitude), R11 = low byte
  2258/ DF8 :                            ;         R13 = sub mode (from check_underflow/normalize/overflow)
  2259/ DF8 :                            ; R11 bits 7:5 select fractional freq dither pattern from ROM table at $0232.
@@ -2266,7 +2266,7 @@
  2266/ E04 : C2 BA                              LDC     R11, @RR10                      ; R11 = ROM[$0232+i] = fractional dither pattern (0-7 of 8 bits set)
  2267/ E06 :                            finalize_output.pitch_output.underflow_shift_entry:                                ; 1 refs
  2268/ E06 :                            ; 8th RR restores PITCH_ENV to original value after
- 2269/ E06 :                            ; 7 RR's in pitch_acc_positive/overflow multiply. Needed when ECLK is
+ 2269/ E06 :                            ; 7 RR's in pitch_apply/overflow multiply. Needed when ECLK is
  2270/ E06 :                            ; already pending or bus not free (PITCH_ENV not refreshed from Port 1).
  2271/ E06 :                            ; Also entry from underflow_shift cap (R12=$1E, R11=0 = no dither).
  2272/ E06 : E0 1A                              RR      PITCH_ENV
@@ -2429,10 +2429,10 @@
  2429/ ECE : BF                                 IRET
  2430/ ECF :                            
  2431/ ECF :                            ; ============================================================
- 2432/ ECF :                            ; === ACC was negative (carry from multiply bit 11 + large unsigned ACC) ($0ECF) ===
+ 2432/ ECF :                            ; === Overflow path: result > 16 bits. Halve + re-apply PITCH_ENV. Should rarely fire with correct ACC base ($0ECF) ===
  2433/ ECF :                            ; ============================================================
  2434/ ECF :                                    ORG     0ECFh
- 2435/ ECF :                            finalize.pitch_acc_negative:                                ; 1 refs
+ 2435/ ECF :                            finalize.pitch_overflow:                                ; 1 refs
  2436/ ECF : C0 EA                              RRC     R10
  2437/ ED1 : C0 EB                              RRC     R11
  2438/ ED3 : A4 E4 1A                           CP      PITCH_ENV, ZERO
@@ -2443,7 +2443,7 @@
  2443/ EDF : FB 04                              JR      NC, .L_0EE5
  2444/ EE1 : 02 DB                              ADD     R13, R11
  2445/ EE3 : 12 CA                              ADC     R12, R10
- 2446/ EE5 :                            .L_0EE5:                                ; called from: finalize.pitch_acc_negative($0EDF)
+ 2446/ EE5 :                            .L_0EE5:                                ; called from: finalize.pitch_overflow($0EDF)
  2447/ EE5 : C0 EC                              RRC     R12
  2448/ EE7 : C0 ED                              RRC     R13
  2449/ EE9 : E0 1A                              RR      PITCH_ENV
@@ -2557,7 +2557,7 @@
  2557/ F92 :                            ; (no dither = exact pitch, enters underflow_shift_entry skipping dither lookup).
  2558/ F92 : A6 ED 0F                           CP      R13, #0Fh
  2559/ F95 : FB 0E                              JR      NC, .L_0FA5                     ; sub < 15 → keep normalizing
- 2560/ F97 : CE                                 INC     R12                             ; INC sub (exponent++)
+ 2560/ F97 : DE                                 INC     R13                             ; INC sub (exponent++)
  2561/ F98 : CF                                 RCF
  2562/ F99 : 10 EB                              RLC     R11                             ; RLC R11:R12 = mantissa x2 (shift bits up, dither bits accumulate in R11)
  2563/ F9B : 10 EC                              RLC     R12
@@ -2568,36 +2568,41 @@
  2568/ FA5 : CC 1E                              LD      R12, #1Eh                       ; cap: force R12=$1E (minimum normalized magnitude)
  2569/ FA7 : B0 EB                              CLR     R11                             ; R11=0 → SPH=$00 at synthesis_output → no timer dither (exact integer pitch)
  2570/ FA9 : 8D 0E 06                           JP      finalize_output.pitch_output.underflow_shift_entry; → underflow_shift_entry: skip dither table lookup, R11=0 passes through to SPH
- 2571/ FAC : 46 E8 80                           OR      ACC_HI, #80h
- 2572/ FAF : 8D 0C CC                           JP      finalize_output.multiply
- 2573/ FB2 :                            L_0FB2:                                ; called from: .acc_sign_check($0D60)
- 2574/ FB2 : 76 E8 80                           TM      ACC_HI, #80h
- 2575/ FB5 : ED 0E CF                           JP      NZ, finalize.pitch_acc_negative
- 2576/ FB8 : 8D 0D 63                           JP      finalize.pitch_acc_positive
- 2577/ FBB : FF                                 NOP
- 2578/ FBC : FF                                 NOP
- 2579/ FBD : 8D 02 3A                           JP      init
- 2580/ FC0 :                            
- 2581/ FC0 :                            ; === Quarter-sine scaling LUT ===
- 2582/ FC0 :                                    ORG     0FC0h
- 2583/ FC0 : 03 06 09 0C                        DB      03h, 06h, 09h, 0Ch              ; [0]-[3]
- 2584/ FC4 : 10 13 16 19                        DB      10h, 13h, 16h, 19h              ; [4]-[7]
- 2585/ FC8 : 1C 1F 22 25                        DB      1Ch, 1Fh, 22h, 25h              ; [8]-[11]
- 2586/ FCC : 28 2B 2E 31                        DB      28h, 2Bh, 2Eh, 31h              ; [12]-[15]
- 2587/ FD0 : 33 36 39 3C                        DB      33h, 36h, 39h, 3Ch              ; [16]-[19]
- 2588/ FD4 : 3F 41 44 47                        DB      3Fh, 41h, 44h, 47h              ; [20]-[23]
- 2589/ FD8 : 49 4C 4E 51                        DB      49h, 4Ch, 4Eh, 51h              ; [24]-[27]
- 2590/ FDC : 53 55 58 5A                        DB      53h, 55h, 58h, 5Ah              ; [28]-[31]
- 2591/ FE0 : 5C 5E 60 62                        DB      5Ch, 5Eh, 60h, 62h              ; [32]-[35]
- 2592/ FE4 : 64 66 68 6A                        DB      64h, 66h, 68h, 6Ah              ; [36]-[39]
- 2593/ FE8 : 6B 6D 6F 70                        DB      6Bh, 6Dh, 6Fh, 70h              ; [40]-[43]
- 2594/ FEC : 71 73 74 75                        DB      71h, 73h, 74h, 75h              ; [44]-[47]
- 2595/ FF0 : 76 78 79 7A                        DB      76h, 78h, 79h, 7Ah              ; [48]-[51]
- 2596/ FF4 : 7A 7B 7C 7D                        DB      7Ah, 7Bh, 7Ch, 7Dh              ; [52]-[55]
- 2597/ FF8 : 7D 7E 7E 7E                        DB      7Dh, 7Eh, 7Eh, 7Eh              ; [56]-[59]
- 2598/ FFC : 7F 7F 7F 7F                        DB      7Fh, 7Fh, 7Fh, 7Fh              ; [60]-[63]
- 2599/1000 :                            
- 2600/1000 :                                    END
+ 2571/ FAC : FF                                 NOP
+ 2572/ FAD : FF                                 NOP
+ 2573/ FAE : FF                                 NOP
+ 2574/ FAF : FF                                 NOP
+ 2575/ FB0 : FF                                 NOP
+ 2576/ FB1 : 8D 02 3A                           JP      init
+ 2577/ FB4 : FF                                 NOP
+ 2578/ FB5 : FF                                 NOP
+ 2579/ FB6 : FF                                 NOP
+ 2580/ FB7 : 8D 02 3A                           JP      init
+ 2581/ FBA : FF                                 NOP
+ 2582/ FBB : FF                                 NOP
+ 2583/ FBC : FF                                 NOP
+ 2584/ FBD : 8D 02 3A                           JP      init
+ 2585/ FC0 :                            
+ 2586/ FC0 :                            ; === Quarter-sine scaling LUT ===
+ 2587/ FC0 :                                    ORG     0FC0h
+ 2588/ FC0 : 03 06 09 0C                        DB      03h, 06h, 09h, 0Ch              ; [0]-[3]
+ 2589/ FC4 : 10 13 16 19                        DB      10h, 13h, 16h, 19h              ; [4]-[7]
+ 2590/ FC8 : 1C 1F 22 25                        DB      1Ch, 1Fh, 22h, 25h              ; [8]-[11]
+ 2591/ FCC : 28 2B 2E 31                        DB      28h, 2Bh, 2Eh, 31h              ; [12]-[15]
+ 2592/ FD0 : 33 36 39 3C                        DB      33h, 36h, 39h, 3Ch              ; [16]-[19]
+ 2593/ FD4 : 3F 41 44 47                        DB      3Fh, 41h, 44h, 47h              ; [20]-[23]
+ 2594/ FD8 : 49 4C 4E 51                        DB      49h, 4Ch, 4Eh, 51h              ; [24]-[27]
+ 2595/ FDC : 53 55 58 5A                        DB      53h, 55h, 58h, 5Ah              ; [28]-[31]
+ 2596/ FE0 : 5C 5E 60 62                        DB      5Ch, 5Eh, 60h, 62h              ; [32]-[35]
+ 2597/ FE4 : 64 66 68 6A                        DB      64h, 66h, 68h, 6Ah              ; [36]-[39]
+ 2598/ FE8 : 6B 6D 6F 70                        DB      6Bh, 6Dh, 6Fh, 70h              ; [40]-[43]
+ 2599/ FEC : 71 73 74 75                        DB      71h, 73h, 74h, 75h              ; [44]-[47]
+ 2600/ FF0 : 76 78 79 7A                        DB      76h, 78h, 79h, 7Ah              ; [48]-[51]
+ 2601/ FF4 : 7A 7B 7C 7D                        DB      7Ah, 7Bh, 7Ch, 7Dh              ; [52]-[55]
+ 2602/ FF8 : 7D 7E 7E 7E                        DB      7Dh, 7Eh, 7Eh, 7Eh              ; [56]-[59]
+ 2603/ FFC : 7F 7F 7F 7F                        DB      7Fh, 7Fh, 7Fh, 7Fh              ; [60]-[63]
+ 2604/1000 :                            
+ 2605/1000 :                                    END
   Symbol Table (* = unused):
   --------------------------
  ACC2_HI :                       14 - |  ACC2_LO :                       15 - |
@@ -2614,32 +2619,29 @@
 *CMP_U_R8R9_1415 :              8ED C | *CMP_U_R8R9_1617 :              8E5 C |
 *CMP_U_R8R9_IMM :               8D1 C |  COMPARE_COMMON :               93A C |
  COMPARE_SIGNED :               915 C |  COMPARE_UNSIGNED :             92F C |
-*CONSTPI :     3.141592653589793239 - | *DATE :                "19.04.2026" - |
-*FALSE :                          0 - |  FINALIZE.PITCH_ACC_NEGATIVE : 0ECF C |
- FINALIZE.PITCH_ACC_NEGATIVE.L_0EE5 :                                  0EE5 C |
- FINALIZE.PITCH_ACC_NEGATIVE.L_0EF1 :                                  0EF1 C |
- FINALIZE.PITCH_ACC_NEGATIVE.L_0EFD :                                  0EFD C |
- FINALIZE.PITCH_ACC_NEGATIVE.L_0F09 :                                  0F09 C |
- FINALIZE.PITCH_ACC_NEGATIVE.L_0F15 :                                  0F15 C |
- FINALIZE.PITCH_ACC_NEGATIVE.L_0F21 :                                  0F21 C |
- FINALIZE.PITCH_ACC_NEGATIVE.L_0F54 :                                  0F54 C |
- FINALIZE.PITCH_ACC_NEGATIVE.MODULATION_DIR_CHECK :                    0F49 C |
- FINALIZE.PITCH_ACC_NEGATIVE.MUL_EXSLA_BIT0 :                          0F2D C |
- FINALIZE.PITCH_ACC_NEGATIVE.MUL_EXSLA_BIT1 :                          0F3B C |
- FINALIZE.PITCH_ACC_NEGATIVE.OVERFLOW_SHIFT_CHECK :                    0F6B C |
- FINALIZE.PITCH_ACC_NEGATIVE.OVERFLOW_SHIFT_CHECK_I :                  0F6D C |
- FINALIZE.PITCH_ACC_NEGATIVE.OVERFLOW_SHIFT_CHECK_II :                 0F72 C |
- FINALIZE.PITCH_ACC_POSITIVE : 0D63 C |
- FINALIZE.PITCH_ACC_POSITIVE.L_0D75 :                                  0D75 C |
- FINALIZE.PITCH_ACC_POSITIVE.L_0D81 :                                  0D81 C |
- FINALIZE.PITCH_ACC_POSITIVE.L_0D8D :                                  0D8D C |
- FINALIZE.PITCH_ACC_POSITIVE.L_0D99 :                                  0D99 C |
- FINALIZE.PITCH_ACC_POSITIVE.L_0DA5 :                                  0DA5 C |
- FINALIZE.PITCH_ACC_POSITIVE.L_0DB1 :                                  0DB1 C |
- FINALIZE.PITCH_ACC_POSITIVE.L_0DE6 :                                  0DE6 C |
- FINALIZE.PITCH_ACC_POSITIVE.MODULATION_DIR_CHECK :                    0DD9 C |
- FINALIZE.PITCH_ACC_POSITIVE.MUL_EXSLA_BIT0 :                          0DBD C |
- FINALIZE.PITCH_ACC_POSITIVE.MUL_EXSLA_BIT1 :                          0DCB C |
+*CONSTPI :     3.141592653589793239 - | *DATE :                "20.04.2026" - |
+*FALSE :                          0 - | *FINALIZE.PITCH_APPLY :        0D63 C |
+ FINALIZE.PITCH_APPLY.L_0D75 : 0D75 C |  FINALIZE.PITCH_APPLY.L_0D81 : 0D81 C |
+ FINALIZE.PITCH_APPLY.L_0D8D : 0D8D C |  FINALIZE.PITCH_APPLY.L_0D99 : 0D99 C |
+ FINALIZE.PITCH_APPLY.L_0DA5 : 0DA5 C |  FINALIZE.PITCH_APPLY.L_0DB1 : 0DB1 C |
+ FINALIZE.PITCH_APPLY.L_0DE6 : 0DE6 C |
+ FINALIZE.PITCH_APPLY.MODULATION_DIR_CHECK :                           0DD9 C |
+ FINALIZE.PITCH_APPLY.MUL_EXSLA_BIT0 :                                 0DBD C |
+ FINALIZE.PITCH_APPLY.MUL_EXSLA_BIT1 :                                 0DCB C |
+ FINALIZE.PITCH_OVERFLOW :     0ECF C |
+ FINALIZE.PITCH_OVERFLOW.L_0EE5 :                                      0EE5 C |
+ FINALIZE.PITCH_OVERFLOW.L_0EF1 :                                      0EF1 C |
+ FINALIZE.PITCH_OVERFLOW.L_0EFD :                                      0EFD C |
+ FINALIZE.PITCH_OVERFLOW.L_0F09 :                                      0F09 C |
+ FINALIZE.PITCH_OVERFLOW.L_0F15 :                                      0F15 C |
+ FINALIZE.PITCH_OVERFLOW.L_0F21 :                                      0F21 C |
+ FINALIZE.PITCH_OVERFLOW.L_0F54 :                                      0F54 C |
+ FINALIZE.PITCH_OVERFLOW.MODULATION_DIR_CHECK :                        0F49 C |
+ FINALIZE.PITCH_OVERFLOW.MUL_EXSLA_BIT0 :                              0F2D C |
+ FINALIZE.PITCH_OVERFLOW.MUL_EXSLA_BIT1 :                              0F3B C |
+ FINALIZE.PITCH_OVERFLOW.OVERFLOW_SHIFT_CHECK :                        0F6B C |
+ FINALIZE.PITCH_OVERFLOW.OVERFLOW_SHIFT_CHECK_I :                      0F6D C |
+ FINALIZE.PITCH_OVERFLOW.OVERFLOW_SHIFT_CHECK_II :                     0F72 C |
  FINALIZE_OUTPUT :             0CA5 C |
  FINALIZE_OUTPUT.CHECK_UNDERFLOW :                                     0DED C |
  FINALIZE_OUTPUT.CHECK_UNDERFLOW_LD_R12_R10 :                          0F7B C |
@@ -2649,7 +2651,6 @@
  FINALIZE_OUTPUT.FINALIZE_RESET_COUNTER :                              0CC5 C |
  FINALIZE_OUTPUT.FINALIZE_SUB43_CHECK :                                0CB6 C |
  FINALIZE_OUTPUT.L_0CB2 :      0CB2 C |  FINALIZE_OUTPUT.MULTIPLY :    0CCC C |
- FINALIZE_OUTPUT.MULTIPLY.ACC_SIGN_CHECK :                             0D60 C |
  FINALIZE_OUTPUT.MULTIPLY.MUL_BIT1 :                                   0CDC C |
  FINALIZE_OUTPUT.MULTIPLY.MUL_BIT10 :                                  0D48 C |
  FINALIZE_OUTPUT.MULTIPLY.MUL_BIT11 :                                  0D54 C |
@@ -2661,6 +2662,7 @@
  FINALIZE_OUTPUT.MULTIPLY.MUL_BIT7 :                                   0D24 C |
  FINALIZE_OUTPUT.MULTIPLY.MUL_BIT8 :                                   0D30 C |
  FINALIZE_OUTPUT.MULTIPLY.MUL_BIT9 :                                   0D3C C |
+ FINALIZE_OUTPUT.MULTIPLY.MUL_OVERFLOW_CHECK :                         0D60 C |
  FINALIZE_OUTPUT.OVERFLOW_SHIFT :                                      0F80 C |
  FINALIZE_OUTPUT.PITCH_OUTPUT :                                        0DF8 C |
  FINALIZE_OUTPUT.PITCH_OUTPUT.UNDERFLOW_SHIFT_ENTRY :                  0E06 C |
@@ -2679,13 +2681,12 @@
  LDEI_CHAIN_START :             25F C | *LISTON :                         1 - |
  LOOP1_CTR :                     18 - |  LOOP2_CTR :                     19 - |
  LOOP_BRANCH_TARGET :           9D5 C |  LOOP_COUNTER_CHECK :           9DD C |
- LOOP_RELOAD_CHECK :            9F2 C |  L_0FB2 :                      0FB2 C |
-*MACEXP :                         7 - | *MICRO_1X_DDS :                 0C4 C |
-*MICRO_2X_STEP1 :               0AC C | *MICRO_2X_STEP2 :               0B8 C |
-*MICRO_4X_STEP1 :                82 C | *MICRO_4X_STEP2 :                8F C |
-*MICRO_4X_STEP3 :                9B C | *MICRO_4X_STEP4 :               0A4 C |
-*MICRO_8X_STEP1 :                20 C | *MICRO_8X_STEP2 :                2C C |
-*MICRO_8X_STEP3 :                37 C |
+ LOOP_RELOAD_CHECK :            9F2 C | *MACEXP :                         7 - |
+*MICRO_1X_DDS :                 0C4 C | *MICRO_2X_STEP1 :               0AC C |
+*MICRO_2X_STEP2 :               0B8 C | *MICRO_4X_STEP1 :                82 C |
+*MICRO_4X_STEP2 :                8F C | *MICRO_4X_STEP3 :                9B C |
+*MICRO_4X_STEP4 :               0A4 C | *MICRO_8X_STEP1 :                20 C |
+*MICRO_8X_STEP2 :                2C C | *MICRO_8X_STEP3 :                37 C |
  MICRO_8X_STEP3.MICRO_LOOKUP_OVERFLOW :                                  41 C |
 *MICRO_8X_STEP4 :                44 C | *MICRO_8X_STEP5 :                51 C |
 *MICRO_8X_STEP6 :                5E C | *MICRO_8X_STEP7 :                6A C |
@@ -2803,12 +2804,12 @@
  SYNTHESIS_OUTPUT.SYNTHESIS_OUTPUT_COMMON :                            0E94 C |
 *SYNTHESIS_OUTPUT.SYNTHESIS_PASS_DONE :                                0EA6 C |
 *SYNTHESIS_OUTPUT.UPDATE_PHASE_INCREMENT :                             0E87 C |
-*TIME :                  "12:05:24" - |  TIMER_VAL :                     1D - |
+*TIME :                  "14:38:01" - |  TIMER_VAL :                     1D - |
 *TRUE :                           1 - | *UPDATE_PATH :                  330 C |
  UPDATE_PATH.L_0356 :           356 C |  UPDATE_PATH.L_0368 :           368 C |
 *VERSION :                     142F - |  VOICE_PARAM_UPDATE :           374 C |
-    324 symbols
-    128 unused symbols
+    323 symbols
+    129 unused symbols
   Register Definitions (* = unused):
   ----------------------------------
  ACC_HI --> R8                        |  ACC_LO --> R9                       
@@ -2823,7 +2824,7 @@
 STANDARD (0 changed characters)
 1 code page
 0.01 seconds assembly time
-   2601 lines source file
+   2606 lines source file
       2 passes
       0 errors
       0 warnings

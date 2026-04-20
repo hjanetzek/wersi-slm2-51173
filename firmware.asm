@@ -515,7 +515,7 @@ micro_wrap_dds:
 ; === RESET / INITIALIZATION ($023A) ===
 ; ============================================================
         ORG     023Ah
-init:                                ; 2 refs
+init:                                ; 4 refs
         CLR     0FCh                            ; 0FC=FLAGS (flags register)
 init_srp:                                ; 1 refs
         SRP     #00h
@@ -2035,7 +2035,7 @@ op_lfsr_mul_1415:
         JP      interpreter_reentry
 
 ; ============================================================
-; === Finalize: ACC clamp + 12x16 multiply + envelope + pitch output ($0CA5) ===
+; === Finalize: ACC clamp + 12x12 unsigned multiply + pitch envelope + pitch output ($0CA5) ===
 ; ============================================================
         ORG     0CA5h
 finalize_output:                                ; 1 refs
@@ -2063,19 +2063,19 @@ finalize_output:                                ; 1 refs
         JR      finalize_output.multiply
 finalize_output.entry:                                ; 20 refs
         INC     PROG_CTR
-finalize_output.multiply:                                ; 13 refs
-; 12x16 fixed-point multiply
-; Formula: R10:R11 = R8:R9 * COEFF / 2048
-; COEFF is 1.11 fixed-point (1 integer bit, 11 fractional bits):
+finalize_output.multiply:                                ; 12 refs
+; 12x12 unsigned fixed-point multiply.
+; Formula: R10:R11 = ACC[11:0] * COEFF[11:0] / 2048
+; ACC is unsigned 12-bit: {R8[7:0], R9[7:4]} (low nibble of R9 always 0).
+; COEFF is 1.11 fixed-point: {PITCH_HI[3:0], PITCH_LO[7:0]}.
 ;   bit 11 (PITCH_HI bit 3) = integer bit (weight x1.0)
-;   bits 10:0 = fractional (weight x0.0 to x0.999)
-;   Range: 0.0 to ~2.0.  Unity (x1.0) at COEFF=$800
-; PITCH_HI[5:4] = EXSLA staging (not used by multiply)
-; PITCH_HI[7:6] = EXSLA bits (used by pitch_acc_positive AFTER multiply)
-; 12 unrolled iterations: 8 from PITCH_LO + 4 from PITCH_HI[3:0]
-; NOTE: no final RRC after last iteration -> bit 11 has weight 1.0
-; When COEFF > $800 (multiplier > 1.0): result can exceed ACC
-;   -> carry after last ADC -> JP C, overflow
+;   bits 10:0 = fractional.  Range: 0.0 to ~2.0. Unity at COEFF=$800.
+; PITCH_HI[5:4] = EXSLA staging (not used by multiply).
+; PITCH_HI[7:6] = EXSLA bits (used by pitch_apply AFTER multiply).
+; 12 unrolled iterations: 8 from PITCH_LO + 4 from PITCH_HI[3:0].
+; NOTE: no final RRC after bit 11 iteration -> bit 11 has weight 1.0.
+; Carry after bit 11 = genuine overflow (result > 16 bits) -> pitch_overflow.
+; With correct ACC base (~$8000), overflow should rarely fire.
         LD      R12, PITCH_HI
         LD      R13, PITCH_LO                   ; R13=PITCH_LO
         CLR     R10                             ; clear result accumulator R10:R11
@@ -2159,17 +2159,17 @@ finalize_output.multiply:                                ; 13 refs
         RRC     R11
 ; Coeff bit 11 = PITCH_HI bit 3 (integer bit, weight 1.0).
 ; Last iteration: adds ACC at FULL weight (no final RRC shift).
-; When bit 11=1, carry from ADC is an ACC SIGN TEST:
-;   ACC positive (< $8000): partial + ACC fits → carry=0 → pitch_acc_positive
-;   ACC negative (>= $8000): partial + large unsigned → carry=1 → pitch_acc_negative
-; Bit 11 must be 1 for sign detection to work. If 0, carry is random.
+; With bit 11 set: result ≈ ACC × (1 + fraction). Can overflow if ACC is large.
+; With bit 11 clear: result = ACC × fraction (< ACC). Never overflows.
+; Carry from ADC = genuine overflow (result > 16 bits), NOT a sign test.
+; With correct ACC base ($8000 ± noise), overflow should rarely fire.
         RR      R12
-        JR      NC, .acc_sign_check             ; bit 11 clear → skip ADD, carry from previous RRC (unreliable)
+        JR      NC, .mul_overflow_check         ; bit 11 clear → skip ADD, carry from previous RRC (not meaningful)
         ADD     R11, ACC_LO                     ; bit 11 set → add ACC at weight 1.0 (result ≈ ACC × (1 + fraction))
         ADC     R10, ACC_HI
-.acc_sign_check:                                ; 1 refs
-        JP      L_0FB2                          ; carry = ACC sign: positive → pitch_acc_positive, negative → pitch_acc_negative
-finalize.pitch_acc_positive:                                ; 1 refs
+.mul_overflow_check:                                ; 1 refs
+        JP      C, finalize.pitch_overflow      ; carry = overflow: result > 16 bits → pitch_overflow (halve + re-apply)
+finalize.pitch_apply:
         CP      PITCH_ENV, ZERO
         JP      Z, finalize_output.check_underflow_ld_r12_r10; LD R12, R10 - returns to finalize_output.check_underflow
         CLR     R12
@@ -2178,7 +2178,7 @@ finalize.pitch_acc_positive:                                ; 1 refs
         JR      NC, .L_0D75
         ADD     R13, R11
         ADC     R12, R10
-.L_0D75:                                ; called from: finalize.pitch_acc_positive($0D6F)
+.L_0D75:                                ; called from: finalize.pitch_apply($0D6F)
         RRC     R12                             ; skip bit0 envelope direction handled at 0xDD9
         RRC     R13
         RR      PITCH_ENV
@@ -2253,7 +2253,7 @@ finalize_output.check_underflow:                                ; 2 refs
         CP      R12, #1Eh
         JP      C, finalize_output.underflow_shift; returns to pitch_output[.underflow_shift_entry]
 finalize_output.pitch_output:                                ; 6 refs
-; Paths from finalize.envelope and finalize.pitch_acc_negative join herepitch_output: prepare synthesis_output parameters
+; Paths from finalize.envelope and finalize.pitch_overflow join herepitch_output: prepare synthesis_output parameters
 ; Inputs: R12 = multiply result high (magnitude), R11 = low byte
 ;         R13 = sub mode (from check_underflow/normalize/overflow)
 ; R11 bits 7:5 select fractional freq dither pattern from ROM table at $0232.
@@ -2266,7 +2266,7 @@ finalize_output.pitch_output:                                ; 6 refs
         LDC     R11, @RR10                      ; R11 = ROM[$0232+i] = fractional dither pattern (0-7 of 8 bits set)
 finalize_output.pitch_output.underflow_shift_entry:                                ; 1 refs
 ; 8th RR restores PITCH_ENV to original value after
-; 7 RR's in pitch_acc_positive/overflow multiply. Needed when ECLK is
+; 7 RR's in pitch_apply/overflow multiply. Needed when ECLK is
 ; already pending or bus not free (PITCH_ENV not refreshed from Port 1).
 ; Also entry from underflow_shift cap (R12=$1E, R11=0 = no dither).
         RR      PITCH_ENV
@@ -2429,10 +2429,10 @@ irq1_handler:
         IRET
 
 ; ============================================================
-; === ACC was negative (carry from multiply bit 11 + large unsigned ACC) ($0ECF) ===
+; === Overflow path: result > 16 bits. Halve + re-apply PITCH_ENV. Should rarely fire with correct ACC base ($0ECF) ===
 ; ============================================================
         ORG     0ECFh
-finalize.pitch_acc_negative:                                ; 1 refs
+finalize.pitch_overflow:                                ; 1 refs
         RRC     R10
         RRC     R11
         CP      PITCH_ENV, ZERO
@@ -2443,7 +2443,7 @@ finalize.pitch_acc_negative:                                ; 1 refs
         JR      NC, .L_0EE5
         ADD     R13, R11
         ADC     R12, R10
-.L_0EE5:                                ; called from: finalize.pitch_acc_negative($0EDF)
+.L_0EE5:                                ; called from: finalize.pitch_overflow($0EDF)
         RRC     R12
         RRC     R13
         RR      PITCH_ENV
@@ -2557,7 +2557,7 @@ finalize_output.underflow_shift:                                ; 2 refs
 ; (no dither = exact pitch, enters underflow_shift_entry skipping dither lookup).
         CP      R13, #0Fh
         JR      NC, .L_0FA5                     ; sub < 15 → keep normalizing
-        INC     R12                             ; INC sub (exponent++)
+        INC     R13                             ; INC sub (exponent++)
         RCF
         RLC     R11                             ; RLC R11:R12 = mantissa x2 (shift bits up, dither bits accumulate in R11)
         RLC     R12
@@ -2568,12 +2568,17 @@ finalize_output.underflow_shift:                                ; 2 refs
         LD      R12, #1Eh                       ; cap: force R12=$1E (minimum normalized magnitude)
         CLR     R11                             ; R11=0 → SPH=$00 at synthesis_output → no timer dither (exact integer pitch)
         JP      finalize_output.pitch_output.underflow_shift_entry; → underflow_shift_entry: skip dither table lookup, R11=0 passes through to SPH
-        OR      ACC_HI, #80h
-        JP      finalize_output.multiply
-L_0FB2:                                ; called from: .acc_sign_check($0D60)
-        TM      ACC_HI, #80h
-        JP      NZ, finalize.pitch_acc_negative
-        JP      finalize.pitch_acc_positive
+        NOP
+        NOP
+        NOP
+        NOP
+        NOP
+        JP      init
+        NOP
+        NOP
+        NOP
+        JP      init
+        NOP
         NOP
         NOP
         JP      init
