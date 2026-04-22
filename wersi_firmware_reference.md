@@ -66,7 +66,7 @@ Architecture: A two-level interpreter.
 **OUTER level** — micro-program interpreter at $058E. Runs synchronously per
 RAUD trigger. Decodes a 32-byte voice program (loaded from slave RAM into
 registers $1D-$3C) through a 76-instruction dispatch table. Produces a
-scaled waveform sample in R8:R9.
+pitch scale factor in accumulator R8:R9.
 
 **INNER level** — IRQ4 micro-op chain. Runs at pitch rate (timer T0 overflow).
 Each tick executes one DDS micro-op ($0019-$00F2): phase accumulation via
