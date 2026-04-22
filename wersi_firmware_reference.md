@@ -70,7 +70,7 @@ scaled waveform sample in R8:R9.
 
 **INNER level** — IRQ4 micro-op chain. Runs at pitch rate (timer T0 overflow).
 Each tick executes one DDS micro-op ($0019-$00F2): phase accumulation via
-RL SPH + ADC R6,R4, then sine table lookup and accumulate.
+RL SPH + ADC R6,R4, then dac ouput by current micro-op and calc next sample phase.
 
 ### ROM Memory Map
 
