@@ -27,8 +27,10 @@ import sys
 def read_trace(path):
     """Read binary trace file, yield tuples.
 
-    16-byte records (D/L/R/U): (cycles, pc, event, value, port0, port2, bank, flags, 0,0,0,0, 0,0,0,0)
-    24-byte records (S):       (cycles, pc, event, value, port0, port2, bank, flags, r13,r14,r10,opc, r5,r7,mode,r15)
+    16-byte records (D/L/R/U): base 16 bytes, no extension.
+    32-byte records (S):       base 16 + 16 ext (r13,r14,r10,opc, r5,r7,mode,r15,
+                                               SPH,PRE0,R6,pad, mul_hi,mul_lo,coeff_hi,coeff_lo)
+    24-byte records (E):       base 16 + 8 ext (pc ring buffer)
     """
     with open(path, 'rb') as f:
         hdr = f.read(8)
@@ -51,20 +53,22 @@ def read_trace(path):
             ext = (0, 0, 0, 0)
             ext2 = (0, 0, 0, 0)
             ext3 = (0, 0, 0, 0)
+            ext4 = (0, 0, 0, 0)
             if event == 'S':
-                ext_bytes = f.read(12)
-                if len(ext_bytes) < 12:
+                ext_bytes = f.read(16)
+                if len(ext_bytes) < 16:
                     break
                 ext = (ext_bytes[0], ext_bytes[1], ext_bytes[2], ext_bytes[3])
                 ext2 = (ext_bytes[4], ext_bytes[5], ext_bytes[6], ext_bytes[7])
                 ext3 = (ext_bytes[8], ext_bytes[9], ext_bytes[10], ext_bytes[11])
+                ext4 = (ext_bytes[12], ext_bytes[13], ext_bytes[14], ext_bytes[15])
             elif event == 'E':
                 ext_bytes = f.read(8)
                 if len(ext_bytes) < 8:
                     break
                 ext = (ext_bytes[0], ext_bytes[1], ext_bytes[2], ext_bytes[3])
                 ext2 = (ext_bytes[4], ext_bytes[5], ext_bytes[6], ext_bytes[7])
-            yield cycles, pc, event, value, port0, port2, bank, flags, *ext, *ext2, *ext3
+            yield cycles, pc, event, value, port0, port2, bank, flags, *ext, *ext2, *ext3, *ext4
 
 
 def write_vcd(trace_path, output_path, clock_mhz=12.0):
@@ -104,7 +108,14 @@ def write_vcd(trace_path, output_path, clock_mhz=12.0):
         f.write("$var wire 8 5 r5 [7:0] $end\n")          # R5 = micro-op dispatch target
         f.write("$var wire 8 7 r7 [7:0] $end\n")          # R7 = phase / waveform index
         f.write("$var wire 8 m mode [7:0] $end\n")         # reg[$10] = mode byte
+        f.write("$var wire 8 R r15 [7:0] $end\n")          # R15 = wrap point (Mode B) / skip offset (Mode C)
         f.write("$var wire 32 Z eff_pitch [31:0] $end\n")  # effective pitch period (ext clocks per waveform cycle)
+        f.write("$var wire 8 H mul_hi [7:0] $end\n")        # reg[$40] = multiply result high (R10, from stub at $0FAC)
+        f.write("$var wire 8 h mul_lo [7:0] $end\n")        # reg[$41] = multiply result low  (R11, from stub at $0FAC)
+        f.write("$var wire 16 M mul_16 [15:0] $end\n")      # reg[$40]:reg[$41] as signed 16-bit
+        f.write("$var wire 8 G coeff_hi [7:0] $end\n")      # reg[$12] = COEFF_HI (PITCH_HI)
+        f.write("$var wire 8 g coeff_lo [7:0] $end\n")      # reg[$13] = COEFF_LO (PITCH_LO)
+        f.write("$var wire 16 K coeff_16 [15:0] $end\n")    # reg[$12]:reg[$13] as 16-bit
         f.write("$upscope $end\n")
         f.write("$scope module errors $end\n")
         f.write("$var wire 1 u unmap_hit $end\n")          # 1 when unmapped reg read
@@ -147,7 +158,7 @@ def write_vcd(trace_path, output_path, clock_mhz=12.0):
         r1e_clear_time = -1
         raud_clear_time = -1
 
-        for cycles, pc, event, value, port0, port2, bank, flags, ext0, ext1, ext2, ext3, ext4, ext5, ext6, ext7, ext8, ext9, ext10, ext11 in events:
+        for cycles, pc, event, value, port0, port2, bank, flags, ext0, ext1, ext2, ext3, ext4, ext5, ext6, ext7, ext8, ext9, ext10, ext11, ext12, ext13, ext14, ext15 in events:
             time_ns = int(cycles * cycle_ns)
 
             # Clear reg[$1E] change pulse after 200ns
@@ -211,6 +222,7 @@ def write_vcd(trace_path, output_path, clock_mhz=12.0):
                 f.write(f"b{ext4:08b} 5\n")    # R5 (micro-op dispatch)
                 f.write(f"b{ext5:08b} 7\n")    # R7 (phase / waveform idx)
                 f.write(f"b{ext6:08b} m\n")    # reg[$10] (mode byte)
+                f.write(f"b{ext7:08b} R\n")    # R15 (wrap point / skip offset)
                 # ext8=SPH(dither), ext9=PRE0, ext10=R6(TIMER_LOAD)
                 sph = ext8
                 pre0 = ext9
@@ -233,6 +245,19 @@ def write_vcd(trace_path, output_path, clock_mhz=12.0):
                 eff_pitch = timer_eff_x8 * prescaler * 4 * chain_len * 64 // (phase_inc * 8)
                 eff_pitch = min(eff_pitch, 0xFFFFFFFF)  # clamp to 32-bit
                 f.write(f"b{eff_pitch:032b} Z\n")
+                # ext12=mul_hi($40), ext13=mul_lo($41), ext14=coeff_hi($12), ext15=coeff_lo($13)
+                mul_hi = ext12
+                mul_lo = ext13
+                coeff_hi = ext14
+                coeff_lo = ext15
+                mul_16 = (mul_hi << 8) | mul_lo
+                coeff_16 = (coeff_hi << 8) | coeff_lo
+                f.write(f"b{mul_hi:08b} H\n")
+                f.write(f"b{mul_lo:08b} h\n")
+                f.write(f"b{mul_16:016b} M\n")
+                f.write(f"b{coeff_hi:08b} G\n")
+                f.write(f"b{coeff_lo:08b} g\n")
+                f.write(f"b{coeff_16:016b} K\n")
             elif event == 'U':
                 # Unmapped register read: value=addr, port0=R5, port2=reg1E, bank=R7, flags=mode
                 f.write("1u\n")

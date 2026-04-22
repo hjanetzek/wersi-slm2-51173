@@ -34,8 +34,8 @@ ROM extracted from die photo via maskromtool/gatorom (`--decode-z86x1 -r 0`).
    - 5.4 Constraints
 6. [Synthesis Modes](#6-synthesis-modes)
    - 6.1 Mode A ($050E) — Oversampled wavetable + direct DDS
-   - 6.2 Mode B ($04DD) — Variable-duty DDS
-   - 6.3 Mode C ($0412) — Programmable-wrap DDS
+   - 6.2 Mode B ($04DD) — Variable-duty DDS ($CF)
+   - 6.3 Mode C ($0412) — Programmable-wrap DDS ($F2)
    - 6.4 Synthesis Output Parameter Table ($0101-$0190)
    - 6.5 Coefficient Multiply — Pitch Envelope Scaling
 7. [Arithmetic Routines](#7-arithmetic-routines)
@@ -369,7 +369,7 @@ special runtime significance — it is always equivalent to $0x.
 Written by the master CPU during SETUP. Copied from slave_ram[$FA] to reg[$10].
 
 ```
-  bit 7:   Pitch envelope override (1 = reg[$1A] forced to 0)
+  bit 7:   Pitch envelope enable (1 = load PITCH_ENV from COP, 0 = force PITCH_ENV=0 "fixed formant")
   bit 6:   Used by coeff multiply (TCM in $0AC3)
   bits 5:4: Synthesis mode:
               $20 = Mode A — Oversampled wavetable + direct DDS ($20/$82/$AC/$C4)
@@ -940,40 +940,108 @@ phase increment for DDS modes, this covers the full audible range.
 The sub 7/8 boundary separates two incompatible R14 usages: working
 sample register (oversampled chains) vs constant frequency step (DDS).
 
-### 6.2 Mode B ($04DD) — Variable-duty DDS
+### 6.2 Mode B ($04DD) — Variable-duty DDS ($CF)
 
-Selected when MODE bits 5:4 = $00. Uses the $CF→$DA→$E9 micro-op chain
-for all sub modes (0-10), with $19 (silence) for sub 11+.
+Selected when MODE bits 5:4 = $00. Setup: synthesis_mode_b ($04DD).
+Micro-op: $CF/$DA/$E9 (variable-duty cycle DDS).
 
-Fills the waveform table reg[$40-$7F] from slave RAM, optionally applying
-a frequency-dependent offset subtraction during setup.
+Note: MODE=$00 reads param table section labeled "Mode C" in the listing
+(offset arithmetic: R13=(sub+0)*3+1 indexes section 0 which contains $CF).
+The naming follows the param table section labels, not the MODE register value.
 
-The $CF chain implements a variable-duty cycle DDS:
-- $CF (only this step outputs to DAC): scans PHASE through $40-$7F
-- $DA/$E9 (no DAC output): advance through skip zone until carry resets
-- R14 = freq step, R15 = wrap point (controls duty cycle / timbre)
-- Uses @PHASE indirect addressing (PHASE ranges $40-$7F directly)
+#### Runtime ($CF/$DA/$E9 micro-ops)
 
-**Setup** (from full_setup):
-- R15 = sram[$F9] — waveform length / loop count
-- R14 = sram[$F7] — frequency step
-- R11 = sram[$F6] — waveform base offset in slave RAM
+Three micro-ops form an output→skip→skip cycle:
+- **$CF**: outputs `@PHASE` (reg[PHASE]) to DAC. PHASE scans $40→$7F.
+  When PHASE crosses $7F (MI): `SUB PHASE, R15` sets skip entry point,
+  switches to $DA.
+- **$DA**: `SUB PHASE, #$81` + `ADD PHASE, R14`. No DAC output.
+  On carry (wrap past $FF): reset PHASE=$40, switch to $CF.
+- **$E9**: same as $DA. On carry: reset to $CF.
 
-**If sram[$F7] ≠ 0** (iterative mode, $04EA): reads from slave RAM
-backwards, subtracting R14 per sample, stores to waveform table.
+R14 = freq step (added each IRQ4). R15 = skip entry offset — controls
+where the skip zone starts after the output scan. Larger R15 = shorter
+skip = higher duty cycle = brighter timbre.
 
-**If sram[$F7] = 0** (LDEI mode, $0502): bulk LDEI copy of waveform data.
+#### Setup (synthesis_mode_b at $04DD)
 
-### 6.3 Mode C ($0412) — Programmable-wrap DDS
+Loads waveform samples from slave RAM into reg[$40+].
 
-Selected when MODE bits 5:4 = $10 (fall-through from mode dispatch).
-Uses the $F2 micro-op (programmable-wrap DDS) for all sub modes (0-10),
-with $19 (silence) for sub 11+.
+Inputs:
+- sram[$F7] → R14 (temp): DC offset / formant value to subtract
+- sram[$F6] → R11: waveform source address in slave RAM
+- R15 (from sram[$F9]): sample count - 1
 
-Reads slave RAM[$F7] (frequency step) and [$F6] (base offset).
-Computes initial accumulator via restoring division at $042D.
-The $F2 micro-op handles waveforms of any length (64, 32, or 16 samples)
-via a programmable wrap point in R15.
+Two paths:
+- **R14 ≠ 0** (formant mode): manual loop copies R15 samples backward
+  from sram, subtracting R14 from each sample → DC-shifted waveform.
+- **R14 = 0** (sampling mode): LDEI sled bulk-copies R15 samples directly.
+
+### 6.3 Mode C ($0412) — Programmable-wrap DDS ($F2)
+
+Selected when MODE bits 5:4 = $10 (fall-through). Setup: synthesis_mode_c ($0412).
+Micro-op: $F2 (programmable-wrap DDS).
+
+Note: MODE=$10 reads param table section labeled "Mode B" in the listing
+(offset arithmetic: R13=(sub+$10)*3+1 indexes section 1 which contains $F2).
+
+#### Runtime ($F2 micro-op at $00F2)
+
+Single micro-op per IRQ4. Outputs `reg[$40+PHASE]` to DAC, then compares
+PHASE to R15. If PHASE < R15: PHASE += R14, IRET. If PHASE >= R15:
+PHASE = 0, reload micro-op, IRET. R14 = phase step (from param table T
+byte, typically $01). Frequency = f_timer / R15.
+
+#### Anti-aliasing gate ($0E19)
+
+Before entering synthesis_loop_reentry, pitch_output checks if the new
+sub's T byte satisfies `T*2 < R15`. If not (fewer than 2 samples per
+cycle), the voice is forced to silence (R13=$2E → sub=15, op=$19).
+This prevents aliased output when the phase step is too large.
+
+#### Setup (synthesis_mode_c at $0412)
+
+Computes a wrap-boundary value via 8-bit restoring division, then fills
+the wavetable reg[$40-$7E] with delta-adjusted samples from slave RAM.
+Stores complemented quotient at reg[$7F] as the wrap-boundary marker.
+
+Inputs:
+- sram[$F7] → R14 (temp): freq step (used in division, destroyed)
+- sram[$F6] → R5 (temp): waveform source offset in slave RAM
+- R15 (from sram[$F9]): used in dividend and divisor computation
+
+Algorithm:
+1. Read last waveform sample from sram[sram[$F6] + $3F]
+2. 8-bit restoring division: ((last_sample - freq_step)/2 + R15 + 1) / 2
+   divided by ($41 + R15) / 2
+3. Complement quotient → store at reg[$7F]
+4. Fill reg[$40-$7E] with (sample + delta) from slave RAM backward
+
+#### COP pitch tables
+
+Two pitch tables select per-note parameters (see WIP_mode_bc_synthesis.md):
+- **Sampling mode** (ICB byte[4] bit 7 clear): table at COP ROM $C92E.
+- **Formant mode** (ICB byte[4] bit 7 set): table at COP ROM $CA9A.
+
+Each table entry = 4 bytes: {R15, sub_index, pitch_hi, pitch_lo}.
+The sub_index encodes MODE bits 5:4 (selecting Mode B or C) AND the
+sub-mode, so the synthesis mode can change per note within the same voice.
+
+#### Formant synthesis
+
+The WAVE block's FixFmt region (sram[$B1-$D3], 35 bytes) stores per-note
+formant data. The COP reads a byte from this region using R15 as index
+into `freq_slave_ptr_table` (COP ROM $AC88), then stores it at sram[$F7].
+The setup code uses this formant value in its division and delta
+computation, shaping the waveform timbre per-note.
+
+The wersi-mk1-editor Formant UI edits 29 of these 35 bytes (the first 6
+are header/metadata). The freq_slave_ptr_table maps 59 note indices to
+35 bytes with logarithmic distribution (low notes get 1 byte each, high
+notes share 3-4 notes per byte).
+
+Waveform data in the WAVE block is Fourier coefficients, converted to
+time-domain samples by the COP via inverse FFT before writing to slave RAM.
 
 ### 6.4 Synthesis Output Parameter Table ($0101-$0190)
 
@@ -993,8 +1061,8 @@ Micro-op addresses by mode:
 
 | Mode                | Sub 0-5              | Sub 6-7       | Sub 8-10         | Sub 11+    |
 |---------------------|----------------------|---------------|------------------|------------|
-| Mode C ($10) wrap   | $F2 (wrap DDS)       | $F2           | $F2              | $19 (init) |
-| Mode B ($00) duty   | $CF (duty-cycle DDS) | $CF           | $CF              | $19 (init) |
+| Mode C ($10)        | $F2 (wrap DDS)       | $F2           | $F2              | $19 (init) |
+| Mode B ($00)        | $CF (duty-cycle DDS) | $CF           | $CF              | $19 (init) |
 | Mode A ($20) wvtbl  | $20 (8× oversample)  | $82/$AC (4×/2×) | $C4 (1× direct)| $19 (init) |
 
 Mode $30 (bits 5:4 = $11) is invalid — table entries would overlap

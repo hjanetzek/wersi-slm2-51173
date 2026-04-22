@@ -75,6 +75,37 @@ FREQ_LFSR_STRONG  = make_freq_block([0x00, 0x00, 0x10, 0x00, 0xFF, 0x80])  # REP
 FREQ_LFSR_MILD    = make_freq_block([0x00, 0x00, 0x10, 0x00, 0x40, 0x80])  # REPEAT NOP + LFSR(state=0, coeff=$40, counter=$80)
 FREQ_LFSR_SLOW    = make_freq_block([0x00, 0x00, 0x10, 0x00, 0xFF, 0x04])  # REPEAT NOP + LFSR(state=0, coeff=$FF, counter=$04)
 
+# Caves-style: LOAD base + COND_CTR ramp-in + LFSR
+# Structure: NOP×3, LOAD_R8R9(base), NOP×2, COND_CTR(16), LFSR
+# The LOAD sets ACC to a base value BEFORE LFSR starts. The COND_CTR
+# repeats finalize 16 times to establish stable pitch, then LFSR loops.
+# LFSR noise range is ±2048 around the base.
+# Base must be $4000-$D800 to keep ACC above normalize threshold ($2C00).
+def make_caves_freq(base_hi=0x80):
+    """Build a caves-style FREQ block: LOAD(base) + ramp-in + LFSR."""
+    block = bytearray(32)
+    block[0] = 0x02   # start_offset
+    block[1] = 0xFF   # initial reg[$1E]
+    # Module 0 (offset 2-7): NOP
+    # Module 1 (offset 8-13): LOAD_R8R9
+    block[8] = 0x01   # LOAD_R8R9 opcode (type $1, param nibble 0 → R9=$00)
+    block[9] = base_hi # R8 = base high byte
+    block[10] = 0x00
+    # Module 2 (offset 14-19): NOP padding + LFSR bytecodes
+    # offset 14-15: $00 $10 = COND_CTR(16) ramp-in
+    block[14] = 0x00
+    block[15] = 0x10   # param=16 repeats
+    # offset 16-19: $10 $00 $FF $80 = LFSR (reached after COND_CTR)
+    block[16] = 0x10   # LFSR opcode
+    block[17] = 0x00   # state
+    block[18] = 0xFF   # coeff (max)
+    block[19] = 0x80   # counter (-128 = always full step)
+    return bytes(block)
+
+FREQ_CAVES_FIXED  = make_caves_freq(0x80)  # ACC=$8000 (safe center)
+FREQ_CAVES_ORIG   = make_caves_freq(0xFF)  # ACC=$FF00 (original, wraps!)
+FREQ_OCEAN_FIXED  = make_caves_freq(0x80)  # Same as caves_fixed (ocean+LOAD)
+
 # Opcode $A0 = synth_wavetable_acc (2 bytes) — standard frequency envelope
 # Reads reg[$14:$15] as coefficient, multiplies into R8:R9.
 # This is the standard path for pitched voices (non-LFSR).
@@ -182,9 +213,11 @@ GAP_DURATION  = 200_000    # 100ms silence between notes
 
 def test_case(name, description, mode, sub, fc, fd, exsla=(0, 0),
               waveform=None, freq_block=None, f7=0x00, fb=0x00, fe=0x00, ff=0x80,
-              f6=0x01, f4=0x1F, f5=0x80):
-    """Define a single test case. Returns (name, desc, records_fn)."""
+              f6=0x01, f4=0x1F, f5=0x80, f9=None):
+    """Define a single test case. Returns (name, desc, records_fn).
+    f9: if set, used as sram[$F9] for SETUP (→ R15). PARAM_UPDATE always uses $43 (TMR config)."""
     mode_val = mode | (sub & 0x0F)
+    f9_setup = f9 if f9 is not None else 0x43
 
     def gen(cycle_start):
         cycle = cycle_start
@@ -205,9 +238,10 @@ def test_case(name, description, mode, sub, fc, fd, exsla=(0, 0),
         cycle += 100_000  # 50ms for TMR to take effect
 
         # SETUP — starts synthesis loop (T_OUT already enabled by PARAM_UPDATE)
+        # f9 goes to reg[$0F] = R15 (wrap point for Mode C, sample count for Mode B)
         sram = make_slave_ram(
             cmd=0x01, mode=mode_val, fc=fc, fd=fd, fe=fe, ff=ff,
-            f4=f4, f5=f5, f6=f6, f7=f7, f9=0x43, fb=fb,
+            f4=f4, f5=f5, f6=f6, f7=f7, f9=f9_setup, fb=fb,
             freq_block=freq_block or FREQ_SIMPLE_GAIN,
             waveform=waveform,
         )
@@ -262,15 +296,17 @@ TESTS = [
               MODE_A, 0, fc=0x0A, fd=0x00, exsla=(0, 0),
               waveform=WAVE_BASS),
 
-    # 8. F2 hard sync DDS — Default mode
-    test_case("f2_sync", "Default sub=0 → $F2 hard sync DDS",
-              MODE_C, 0, fc=0x05, fd=0x99, exsla=(1, 1),
-              f7=0x04),
+    # 8. Mode C wrap DDS — sub=3, R15=37, typical sampling mode mid-range
+    test_case("mode_c_mid", "Mode C sub=3, R15=37, sawtooth wrap DDS",
+              MODE_C, 3, fc=0x06, fd=0xA9, exsla=(1, 1),
+              waveform=WAVE_BASS, f7=0x10, f9=0x25,
+              freq_block=make_freq_block([], start_offset=0x2A)),
 
-    # 9. CF soft sync DDS — Mode B
-    test_case("cf_sync", "Mode B sub=0 → $CF soft sync DDS",
-              MODE_B, 0, fc=0x05, fd=0x99, exsla=(1, 1),
-              f7=0x04),
+    # 9. Mode B duty DDS — sub=3, R15=21, typical formant mode
+    test_case("mode_b_mid", "Mode B sub=3, R15=21, sawtooth duty DDS",
+              MODE_B, 3, fc=0x06, fd=0xA9, exsla=(1, 1),
+              waveform=WAVE_BASS, f7=0x10, f9=0x15,
+              freq_block=make_freq_block([], start_offset=0x2A)),
 
     # 10. Alt resampler (sub=9, 32→64 via D7 writes)
     test_case("resample_alt", "Mode A sub=9 → Alt resampler (32→64) + $C4 DDS",
@@ -329,13 +365,25 @@ TESTS = [
               waveform=WAVE_BASS, fb=0xDB,
               freq_block=FREQ_LFSR_SLOW),
 
-    # 20. LFSR noise — caves-like: Mode A sub=10, different COEFF
-    test_case("lfsr_caves", "LFSR strong noise, Mode A sub=10 (caves-like)",
+    # 20. LFSR noise — caves-like (original: ACC base=$FF00, wraps through zero)
+    # test_case("lfsr_caves", "LFSR caves-style ACC=$FF00 base (WRAPS — original broken)",
+    #           MODE_A_NOPITCH, 10, fc=0x05, fd=0x99, exsla=(1, 1),
+    #           waveform=WAVE_BASS, fb=0xC9,
+    #           freq_block=FREQ_CAVES_ORIG),
+
+    # 21. LFSR caves FIXED — ACC base=$8000 (safe center, no wrapping)
+    test_case("lfsr_caves", "LFSR caves-style ACC=$8000 base (safe — no wrapping)",
               MODE_A_NOPITCH, 10, fc=0x05, fd=0x99, exsla=(1, 1),
               waveform=WAVE_BASS, fb=0xC9,
-              freq_block=FREQ_LFSR_STRONG),
+              freq_block=FREQ_CAVES_FIXED),
 
-    # 21. LFSR with pitch tracking (no no pitch modulation)
+    # 22. LFSR ocean FIXED — add LOAD($8000) base that ocean is missing
+    test_case("lfsr_ocean_fixed", "LFSR ocean-style + LOAD ACC=$8000 base (fix missing base)",
+              MODE_A_NOPITCH, 7, fc=0x08, fd=0x64, exsla=(1, 1),
+              waveform=WAVE_BASS, fb=0xDB,
+              freq_block=FREQ_OCEAN_FIXED),
+
+    # 23. LFSR with pitch tracking (no pitch modulation disabled)
     test_case("lfsr_pitched", "LFSR noise with pitch envelope tracking",
               MODE_A, 7, fc=0x08, fd=0x64, exsla=(1, 1),
               waveform=WAVE_BASS, fb=0xDB, fe=0x40, ff=0x80,
@@ -355,6 +403,58 @@ TESTS = [
     test_case("exsla_11", "EXSLA=11 (÷8, soprano bank)",
               MODE_A, 8, fc=0x04, fd=0x50, exsla=(1, 1),
               waveform=WAVE_BASS, f7=0x08),
+
+    # --- Mode C (programmable-wrap DDS $F2) ---
+    # R15 = wrap point, R14 = 1 (from param table T byte).
+    # Frequency = f_timer / R15. Setup code at $0412 computes wrap-boundary
+    # value and fills reg[$40-$7E] with delta-adjusted waveform from slave RAM.
+    # f7 = formant value (DC offset subtracted from samples, also division input).
+
+    # Mode C sub=5 (PRE0=$05, T=$01): high IRQ4 rate, R15=37 (typical octave 0)
+    test_case("mode_c_wrap37", "Mode C sub=5, R15=37 (wrap at 37), sawtooth",
+              MODE_C, 5, fc=0x06, fd=0xA9, exsla=(1, 1),
+              waveform=WAVE_BASS, f7=0x10, f9=0x25,
+              freq_block=make_freq_block([], start_offset=0x2A)),  # library $2A = ACC=$8000
+
+    # Mode C sub=8 (PRE0=$05, T=$08): slower timer, R15=40
+    test_case("mode_c_wrap40", "Mode C sub=8, R15=40 (wrap at 40), sawtooth",
+              MODE_C, 8, fc=0x06, fd=0xA9, exsla=(1, 1),
+              waveform=WAVE_BASS, f7=0x10, f9=0x28,
+              freq_block=make_freq_block([], start_offset=0x2A)),
+
+    # Mode C sub=5, R15=37, no formant (f7=0) — direct copy path
+    test_case("mode_c_noformant", "Mode C sub=5, R15=37, f7=0 (no formant delta)",
+              MODE_C, 5, fc=0x06, fd=0xA9, exsla=(1, 1),
+              waveform=WAVE_BASS, f7=0x00, f9=0x25,
+              freq_block=make_freq_block([], start_offset=0x2A)),
+
+    # Mode C sub=5, R15=5 (very short wrap — high frequency buzz)
+    test_case("mode_c_wrap5", "Mode C sub=5, R15=5 (short wrap, high buzz)",
+              MODE_C, 5, fc=0x06, fd=0xA9, exsla=(1, 1),
+              waveform=WAVE_BASS, f7=0x10, f9=0x05,
+              freq_block=make_freq_block([], start_offset=0x2A)),
+
+    # --- Mode B (variable-duty DDS $CF/$DA/$E9) ---
+    # R15 = skip entry offset (controls duty cycle).
+    # R14 = freq step. Setup loads R15 samples with optional DC offset removal.
+
+    # Mode B sub=5 (PRE0=$05, T=$01), R15=21 (typical formant mode)
+    test_case("mode_b_duty21", "Mode B sub=5, R15=21, sawtooth, f7=0x10",
+              MODE_B, 5, fc=0x06, fd=0xA9, exsla=(1, 1),
+              waveform=WAVE_BASS, f7=0x10, f9=0x15,
+              freq_block=make_freq_block([], start_offset=0x2A)),
+
+    # Mode B sub=5, R15=21, no formant (f7=0) — LDEI bulk copy
+    test_case("mode_b_noformant", "Mode B sub=5, R15=21, f7=0 (LDEI direct copy)",
+              MODE_B, 5, fc=0x06, fd=0xA9, exsla=(1, 1),
+              waveform=WAVE_BASS, f7=0x00, f9=0x15,
+              freq_block=make_freq_block([], start_offset=0x2A)),
+
+    # Mode B sub=8, R15=5 (short waveform, high pitch formant range)
+    test_case("mode_b_duty5", "Mode B sub=8, R15=5 (short waveform), sawtooth",
+              MODE_B, 8, fc=0x06, fd=0xA9, exsla=(1, 1),
+              waveform=WAVE_BASS, f7=0x10, f9=0x05,
+              freq_block=make_freq_block([], start_offset=0x2A)),
 ]
 
 # ============================================================

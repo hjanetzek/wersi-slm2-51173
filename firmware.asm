@@ -26,7 +26,7 @@ WAVE_R15        EQU     R15     ; previous waveform sample (interpolation)
 
 ; Memory-mapped register aliases (absolute addresses)
 MODE            EQU     10h     ; mode register (from slave_ram[$FA])
-SAVED_HI        EQU     11h     ; saved state (LFSR high byte / coeff running offset)
+LFSR_VIB_STATE  EQU     11h     ; LFSR high byte / vibrato running state
 PITCH_HI        EQU     12h     ; pitch coeff high: [7:6]=EXSLA [3:0]=coeff.hi (slave_ram[$FC] + EXSLA from Port 3)
 PITCH_LO        EQU     13h     ; pitch coeff low = coeff.lo (from slave_ram[$FD])
 ACC2_HI         EQU     14h     ; secondary accumulator high (NOT R14!)
@@ -44,12 +44,12 @@ MICRO_OP_NEXT   EQU     1Eh     ; micro-op chain address (set by synthesis_outpu
 
 ; === Interrupt vector table (6 vectors × 2 bytes) ===
         ORG     0000h
-        DW      023Ah      ; IRQ0/P3.2    → init
+        DW      023Ah      ; IRQ0/P3.2    → init_full
         DW      0EBEh      ; IRQ1/P3.3    → irq1_handler
-        DW      023Ah      ; IRQ2/P3.1    → init
+        DW      023Ah      ; IRQ2/P3.1    → init_full
         DW      02E0h      ; IRQ3/P3.0    → irq3_handler
         DW      000Fh      ; IRQ4/T0      → irq4_handler
-        DW      023Ah      ; IRQ5/T1      → init
+        DW      023Ah      ; IRQ5/T1      → init_full
 
         ORG     000Ch
 
@@ -58,7 +58,7 @@ MICRO_OP_NEXT   EQU     1Eh     ; micro-op chain address (set by synthesis_outpu
 ; ============================================================
         ORG     000Ch
 reset_entry:
-        JP      init
+        JP      init_full
 
 ; ============================================================
 ; === IRQ4 — Phase Accumulator + Micro-Op Dispatch ($000F) ===
@@ -83,7 +83,7 @@ irq4_handler:
 micro_silence:
         LD      PORT0_DAC, #80h
         LD      MICRO_OP, MICRO_OP_NEXT
-        LD      PHASE, #40h
+        LD      PHASE, #00h
         IRET
 
 ; ============================================================
@@ -470,7 +470,7 @@ micro_wrap_dds:
         DW      0708h      ; opc $94              → op_sub_r8r9_from_1617
         DW      071Ah      ; opc $98              → op_sub_r8r9_from_1415
         DW      0723h      ; opc $9C              → op_sub_1617_from_1415
-        DW      0A7Bh      ; opc $A0              → op_wavetable_acc
+        DW      0A7Bh      ; opc $A0              → op_stdlinear
         DW      060Fh      ; opc $A4              → op_regpair_op_08
         DW      0613h      ; opc $A8              → op_regpair_op_16
         DW      0617h      ; opc $AC              → op_regpair_op_14
@@ -515,8 +515,13 @@ micro_wrap_dds:
 ; === RESET / INITIALIZATION ($023A) ===
 ; ============================================================
         ORG     023Ah
-init:                                ; 4 refs
+init_full:                                ; 4 refs
         CLR     0FCh                            ; 0FC=FLAGS (flags register)
+
+; ============================================================
+; === Also called by op_conditional_counter / WAIT (NOP?) ($023C) ===
+; ============================================================
+        ORG     023Ch
 init_srp:                                ; 1 refs
         SRP     #00h
         LD      0FFh, #40h                      ; 0FF=SPL (stack pointer low)
@@ -526,6 +531,11 @@ init_srp:                                ; 1 refs
         LD      PORT0_DAC, #80h
         LD      PORT2, #05h
         LD      PORT3, #00h
+
+; ============================================================
+; === Also called by cmd_stop ($0250) ===
+; ============================================================
+        ORG     0250h
 init_enable_irq:                                ; 1 refs
         CLR     0FBh                            ; 0FB=IMR (interrupt mask)
         EI
@@ -534,8 +544,13 @@ init_enable_irq:                                ; 1 refs
         LD      0FBh, #08h                      ; 0FB=IMR (interrupt mask)
         CLR     0FAh                            ; 0FA=IRQ (interrupt request)
         EI
-spin:                                ; 2 refs
-        JR      spin
+spin_forever:                                ; 2 refs
+        JR      spin_forever
+
+; ============================================================
+; === Start of LDEI bulk copy ($025F) ===
+; ============================================================
+        ORG     025Fh
 ldei_chain_start:                                ; 1 refs
         LDEI    @R12, @RR10
         LDEI    @R12, @RR10
@@ -619,15 +634,15 @@ irq3_handler:
         LD      0F8h, #14h                      ; 0F8=P01M (port 0/1 mode)
         LDE     R13, @RR10
         TCM     R13, #04h
-        JR      Z, voice_param_update
+        JR      Z, .cmd_voice_param_update
         TCM     0FCh, #02h                      ; 0FC=FLAGS (flags register)
-        JR      NZ, cmd_dispatch
+        JR      NZ, .cmd_dispatch
 
 ; ============================================================
-; === First-time parameter writeback ($0302) ===
+; === First-time setup ($0302) ===
 ; ============================================================
         ORG     0302h
-irq3_first_time:
+.cmd_init:
         LD      R11, #0F5h
         LDE     R11, @RR10
         LD      R12, #02h
@@ -646,60 +661,80 @@ irq3_first_time:
         LDEI    @RR10, @R12
         CP      R12, #1Eh
         JR      ULE, .L_031C
-        JP      init
+        JP      init_full
 
 ; ============================================================
 ; === Command dispatch ($0326) ===
 ; ============================================================
         ORG     0326h
-cmd_dispatch:                                ; 1 refs
+.cmd_dispatch:                                ; 1 refs
         TCM     R13, #02h
-        JR      Z, stop_handler
+        JR      Z, .cmd_stop
         TCM     R13, #01h
-        JR      Z, irq3_full_setup
+        JR      Z, .cmd_full_setup
 
 ; ============================================================
-; === UPDATE — Synthesis parameter update ($0330) ===
+; === RAUD default — reload micro-program pointer + pitch envelope from slave RAM ($0330) ===
 ; ============================================================
         ORG     0330h
-update_path:
+.cmd_run_prog:
+; RAUD default path: called when cmd byte ($F8) has no command bits set.
+; This is the normal per-RAUD update during active synthesis.
+; 
+; Actions:
+;   1. Reload PROG_CTR from sram[source+1] (saved start position)
+;   2. Reload reg[$14:$15] from sram[$FE:$FF] (ACC2 pair)
+;   3. Read pitch envelope from COP via Port 3/Port 1 bus handshake
+;      (same EXSLA + PITCH_ENV update as op_lfsr_noise full_lfsr_step)
+;   4. Clear LOOP1_CTR, LOOP2_CTR, BLOCK_CTR (reset loop state)
+;   5. ADD PROG_CTR, #$1D (convert relative offset to register address)
+;   6. JP micro_program_interpreter (re-run from saved position)
+; 
+; The sram[source+1] value is written to $02 by irq3_first_time on the
+; first RAUD after full_setup. This points to byte[2] of the micro-program
+; (the first opcode, past the 2-byte header). So each RAUD re-executes
+; the entire micro-program from the start.
+; 
+; NOTE: PROG_CTR here is a RELATIVE offset (0-based into the program).
+; The ADD #$1D converts it to an absolute register-file address, since
+; micro-program bytes are stored in reg[$1D] onward after LDEI load.
         LD      R11, #0F5h
-        LDE     R11, @RR10
-        INC     R11
-        LDE     R12, @RR10
-        LD      PROG_CTR, R12
-        LD      R11, #0FEh
-        LD      R12, #14h
-        LDEI    @R12, @RR10
-        LDEI    @R12, @RR10
-        LD      R12, PORT3
-        LD      0F8h, #0Ch                      ; 0F8=P01M (port 0/1 mode)
-        XOR     PORT2, #07h
-        LD      0F6h, #04h                      ; 0F6=P2M (port 2 mode / RARC)
-        TCM     MODE, #80h
-        JR      Z, .L_0356
-        LD      PITCH_ENV, #00h
-        JR      .L_0368
-.L_0356:                                ; called from: update_path($034F)
-        LD      PITCH_ENV, ACC2_LO
-        CLR     ACC2_LO
-        SWAP    R12
+        LDE     R11, @RR10                      ; R11 = sram[$F5] = micro-program source base (e.g., $D4)
+        INC     R11                             ; INC R11 → point to sram[source+1] (saved PROG_CTR start)
+        LDE     R12, @RR10                      ; R12 = sram[source+1] = saved start offset ($02 after first_time)
+        LD      PROG_CTR, R12                   ; PROG_CTR = saved start offset (relative, before ADD #$1D)
+        LD      R11, #0FEh                      ; R11 = $FE (slave RAM address of reg[$14] init)
+        LD      R12, #14h                       ; R12 = $14 (destination register = ACC2_HI)
+        LDEI    @R12, @RR10                     ; reg[$14] = sram[$FE] (ACC2_HI), R12→$15, R11→$FF
+        LDEI    @R12, @RR10                     ; reg[$15] = sram[$FF] (ACC2_LO), R12→$16, R11→$00(wrap)
+        LD      R12, PORT3                      ; R12 = Port 3 (EXSLA routing bits from master)
+        LD      0F8h, #0Ch                      ; 0F8=P01M (port 0/1 mode)  ; P01M = $0C (Port 0 = output, Port 1 = input; release data bus)
+        XOR     PORT2, #07h                     ; XOR Port 2 (toggle bus handshake lines)
+        LD      0F6h, #04h                      ; 0F6=P2M (port 2 mode / RARC)  ; P2M = $04 (RARC = input/high-Z; release bus to master)
+        TCM     MODE, #80h                      ; MODE bit 7: pitch envelope enable?
+        JR      Z, .L_0356                      ; bit 7 SET (Z) → pitch tracking active: load PITCH_ENV + EXSLA
+        LD      PITCH_ENV, #00h                 ; bit 7 CLEAR: fixed formant, no pitch modulation
+        JR      .L_0368                         ; skip to loop counter reset
+.L_0356:                                ; called from: .cmd_run_prog($034F)
+        LD      PITCH_ENV, ACC2_LO              ; PITCH_ENV = ACC2_LO (pitch modulation depth from COP)
+        CLR     ACC2_LO                         ; clear ACC2_LO after consuming it
+        SWAP    R12                             ; extract EXSLA routing: SWAP + RL + AND $C0 → bits [7:6]
         RL      R12
         AND     R12, #0C0h
-        AND     PITCH_HI, #3Fh
-        OR      PITCH_HI, R12
-.L_0368:                                ; called from: update_path($0354)
-        CLR     LOOP1_CTR
+        AND     PITCH_HI, #3Fh                  ; clear EXSLA bits in PITCH_HI (keep coeff bits [5:0])
+        OR      PITCH_HI, R12                   ; merge new EXSLA bits [7:6] into PITCH_HI
+.L_0368:                                ; called from: .cmd_run_prog($0354)
+        CLR     LOOP1_CTR                       ; clear loop counters (micro-program loops restart each RAUD)
         CLR     LOOP2_CTR
-        ADD     PROG_CTR, #1Dh
-        CLR     BLOCK_CTR
-        JP      micro_program_interpreter
+        ADD     PROG_CTR, #1Dh                  ; PROG_CTR += $1D → absolute register address (reg[$1F] for offset $02)
+        CLR     BLOCK_CTR                       ; clear block counter (LFSR/repeat state resets each RAUD)
+        JP      micro_program_interpreter       ; restart micro-program interpreter from saved position
 
 ; ============================================================
 ; === VOICE PARAMETER UPDATE ($0374) ===
 ; ============================================================
         ORG     0374h
-voice_param_update:                                ; 1 refs
+.cmd_voice_param_update:                                ; 1 refs
         INC     R11
         LD      R12, #0F1h
         LDEI    @R12, @RR10
@@ -708,13 +743,13 @@ voice_param_update:                                ; 1 refs
         LD      0F8h, #1Ch                      ; 0F8=P01M (port 0/1 mode)
         XOR     PORT2, #07h
         LD      0F6h, #04h                      ; 0F6=P2M (port 2 mode / RARC)
-        JP      spin
+        JP      spin_forever
 
 ; ============================================================
 ; === STOP — Voice off ($0389) ===
 ; ============================================================
         ORG     0389h
-stop_handler:                                ; 1 refs
+.cmd_stop:                                ; 1 refs
         LD      0F8h, #1Ch                      ; 0F8=P01M (port 0/1 mode)
         XOR     PORT2, #07h
         LD      0F7h, #01h                      ; 0F7=P3M (port 3 mode)
@@ -730,28 +765,42 @@ stop_handler:                                ; 1 refs
 ; === FULL VOICE SETUP ($03A5) ===
 ; ============================================================
         ORG     03A5h
-irq3_full_setup:                                ; 1 refs
+.cmd_full_setup:                                ; 1 refs
+; Full voice setup. Bulk-loads slave RAM parameters into registers,
+; then sets up LFSR state, pitch envelope, EXSLA, and micro-program.
+; 
+; LDEI chain: R11=$F9 (source), R12=$0F (dest). 7 iterations:
+;   sram[$F9] → reg[$0F] = R15 (WAVE_R15)  wrap point / sample count
+;   sram[$FA] → reg[$10] = MODE             synthesis mode + sub-mode
+;   sram[$FB] → reg[$11] = LFSR_VIB_STATE  → ACC3_HI (saved, then $DB overwrites)
+;   sram[$FC] → reg[$12] = PITCH_HI         frequency coefficient high
+;   sram[$FD] → reg[$13] = PITCH_LO         frequency coefficient low
+;   sram[$FE] → reg[$14] = ACC2_HI          pitch envelope param (NOT R14!)
+;   sram[$FF] → reg[$15] = ACC2_LO          pitch fine value (NOT R15!)
+; 
+; Note: ACC2_HI/LO are reg[$14/$15], NOT the same as R14/R15 (reg[$0E/$0F]).
+; After LDEI: R11=$00 (wrapped), R12=$16.
         DI
         LD      0FBh, #08h                      ; 0FB=IMR (interrupt mask)
-        LD      0FCh, R13                       ; 0FC=FLAGS (flags register)
-        AND     R13, #0F8h
+        LD      0FCh, R13                       ; 0FC=FLAGS (flags register)  ; FLAGS = R13 (save command byte for irq3_first_time check)
+        AND     R13, #0F8h                      ; R13 = (R13 & $F8) + $02 → slave address for bus handshake
         ADD     R13, #02h
-        LD      PORT2, R13
-        LD      R11, #0F9h
-        LD      R12, #0Fh
-        LDEI    @R12, @RR10
-        LDEI    @R12, @RR10
-        LDEI    @R12, @RR10
-        LDEI    @R12, @RR10
-        LDEI    @R12, @RR10
-        LDEI    @R12, @RR10
-        LDEI    @R12, @RR10
-        LD      ACC3_HI, SAVED_HI               ; save ACC3_HI, init LFSR state to $DB
-        CLR     ACC3_LO
-        LD      SAVED_HI, #0DBh
-        TCM     MODE, #80h                      ; mode bit 7: fixed formant? (1=freq doesn't track pitch)
-        JR      Z, .pitch_env_from_acc2         ; bit 7 clear → relative formant: load pitch env from ACC2_LO + EXSLA
-        LD      PITCH_ENV, #00h                 ; bit 7 set → fixed formant: no pitch tracking (clear envelope)
+        LD      PORT2, R13                      ; PORT2 = R13 (assert slave select on bus)
+        LD      R11, #0F9h                      ; R11 = $F9 (LDEI source start: sram[$F9])
+        LD      R12, #0Fh                       ; R12 = $0F (LDEI dest start: reg[$0F] = R15)
+        LDEI    @R12, @RR10                     ; sram[$F9] → reg[$0F] = R15: wrap point (Mode C) / sample count (Mode B)
+        LDEI    @R12, @RR10                     ; sram[$FA] → reg[$10] = MODE: mode bits 5:4 + sub bits 3:0
+        LDEI    @R12, @RR10                     ; sram[$FB] → reg[$11] = LFSR_VIB_STATE: used for ACC3_HI init, then overwritten to $DB
+        LDEI    @R12, @RR10                     ; sram[$FC] → reg[$12] = PITCH_HI: coeff high (bits 3:0 = multiply, 7:6 = EXSLA)
+        LDEI    @R12, @RR10                     ; sram[$FD] → reg[$13] = PITCH_LO: coeff low
+        LDEI    @R12, @RR10                     ; sram[$FE] → reg[$14] = ACC2_HI: pitch envelope param
+        LDEI    @R12, @RR10                     ; sram[$FF] → reg[$15] = ACC2_LO: pitch fine value (from voice_write_pitch)
+        LD      ACC3_HI, LFSR_VIB_STATE         ; ACC3_HI = sram[$FB] (move to reg[$16] — this is the actual use of sram[$FB])
+        CLR     ACC3_LO                         ; ACC3_LO = 0
+        LD      LFSR_VIB_STATE, #0DBh           ; LFSR_VIB_STATE = $DB (fixed init seed for LFSR/vibrato)
+        TCM     MODE, #80h                      ; MODE bit 7: pitch envelope enable?
+        JR      Z, .pitch_env_from_acc2         ; bit 7 SET (Z) → pitch tracking active: load PITCH_ENV + EXSLA
+        LD      PITCH_ENV, #00h                 ; bit 7 CLEAR: fixed formant, no pitch modulation
         JR      .load_micro_program             ; skip EXSLA setup
 .pitch_env_from_acc2:                                ; 1 refs
         LD      PITCH_ENV, ACC2_LO              ; initial pitch envelope = ACC2_LO (reg[$15])
@@ -772,7 +821,7 @@ irq3_full_setup:                                ; 1 refs
         LDE     R11, @RR10                      ; R11 = slave_ram[$F5] (micro-program data source pointer)
         LD      R12, #1Dh                       ; R12 = $1D (LDEI destination: reg[$1D] onward = micro-program storage)
         CALL    @RR4                            ; CALL @RR4 → computed jump into LDEI sled at $02xx, loads N bytes from slave RAM
-        LD      PROG_CTR, TIMER_VAL             ; PROG_CTR = reg[$1D] (first micro-program byte = start address)
+        LD      PROG_CTR, TIMER_VAL             ; PROG_CTR = reg[$1D] (first micro-program byte = start_offset / library address)
         LD      PORT0_DAC, #80h
         CLR     PHASE
         TCM     MODE, #20h
@@ -782,150 +831,186 @@ irq3_full_setup:                                ; 1 refs
         LD      PHASE, #40h
 
 ; ============================================================
-; === Mode C — Programmable-wrap DDS ($F2). MODE bits 5:4 = $10 (fall-through) ($0412) ===
+; === Mode C setup — wrap-point division + wavetable fill ($F2). MODE bits 5:4 = $10 ($0412) ===
 ; ============================================================
         ORG     0412h
 synthesis_mode_c:
+; Mode C setup: 8-bit restoring division + wavetable fill.
+; Computes a wrap offset via division, stores it at reg[$7F], then fills
+; reg[$40-$7E] with delta-adjusted waveform samples from slave RAM.
+; 
+; Runtime ($F2 micro-op): DAC = reg[$40+PHASE]; if PHASE >= R15: wrap to 0,
+;   else PHASE += R14. So R14=freq step, R15=wrap point (wavetable length).
+; 
+; Setup inputs (R14/R15 used as temps during setup, NOT runtime values):
+;   sram[$F7] → R14 (temp): freq step (also used by $F2 at runtime)
+;   sram[$F6] → R5 (MICRO_OP, temp): waveform source offset in slave RAM
+;   R15 (= reg[$0F], from sram[$F9] via full_setup LDEI): wrap point / wavetable length
+; 
+; Algorithm:
+;   1. Read last waveform sample from sram[sram[$F6] + $3F]
+;   2. Compute dividend = ((last_sample - freq_step)/2 + R15 + 1) / 2
+;   3. Compute divisor = ($41 + R15) / 2
+;   4. 8-bit restoring division: quotient → R14 (temp)
+;   5. Complement quotient, store at reg[$7F] (wrap-boundary value)
+;   6. Compute delta = complemented_quotient - next_sample
+;   7. Fill reg[$40-$7E] with (sample + delta) from slave RAM backward
+;   8. Restore R10=$10 (slave RAM bank), JP synthesis_loop_entry
         LD      R11, #0F7h
-        LDE     WAVE_R14, @RR10
+        LDE     WAVE_R14, @RR10                 ; R14 = sram[$F7] = freq step (temp: used in division)
         LD      R11, #0F6h
-        LDE     MICRO_OP, @RR10
-        ADD     MICRO_OP, #3Fh
-        LD      ZERO, #10h
-        LDE     R10, @RR4
-        CLR     R11
-        SUB     R10, WAVE_R14
+        LDE     MICRO_OP, @RR10                 ; R5 = sram[$F6] = waveform source offset
+        ADD     MICRO_OP, #3Fh                  ; R5 += $3F → point to last sample in waveform area
+        LD      ZERO, #10h                      ; R4 = $10 (set up RR4 = $10:R5 for slave RAM reads)
+        LDE     R10, @RR4                       ; R10 = sram[R4:R5] = last waveform sample
+        CLR     R11                             ; R11 = 0 (extend to 16-bit for division)
+        SUB     R10, WAVE_R14                   ; R10 -= R14 (last_sample - freq_step)
         RCF
         RRC     R10
         RRC     R11
-        INC     R10
-        ADD     R10, WAVE_R15
-        RRC     R10
+        INC     R10                             ; R10 += 1
+        ADD     R10, WAVE_R15                   ; R10 += R15 (add wrap point)
+        RRC     R10                             ; RRC R10:R11 → divide by 2 again (dividend ready)
         RRC     R11
-        CLR     R13
-        LD      R12, #41h
+        CLR     R13                             ; R13 = 0 (divisor low byte)
+        LD      R12, #41h                       ; R12 = $41 + R15 (divisor base)
         ADD     R12, WAVE_R15
-        CLR     WAVE_R14
-        RRC     R12
+        CLR     WAVE_R14                        ; R14 = 0 (quotient accumulator)
+        RRC     R12                             ; RRC R12:R13 → divisor / 2 (first bit position)
         RRC     R13
-        SUB     R11, R13
+        SUB     R11, R13                        ; --- 8-bit restoring division: 8 unrolled iterations ---
         SBC     R10, R12
-        JR      NC, .L_0447
+        JR      NC, .div_bit1
         ADD     R11, R13
         ADC     R10, R12
-.L_0447:                                ; called from: synthesis_mode_c($0441)
+.div_bit1:                                ; 1 refs
         RLC     WAVE_R14
         RRC     R12
         RRC     R13
         SUB     R11, R13
         SBC     R10, R12
-        JR      NC, .L_0457
+        JR      NC, .div_bit2
         ADD     R11, R13
         ADC     R10, R12
-.L_0457:                                ; called from: .L_0447($0451)
+.div_bit2:                                ; 1 refs
         RLC     WAVE_R14
         RRC     R12
         RRC     R13
         SUB     R11, R13
         SBC     R10, R12
-        JR      NC, .L_0467
+        JR      NC, .div_bit3
         ADD     R11, R13
         ADC     R10, R12
-.L_0467:                                ; called from: .L_0457($0461)
+.div_bit3:                                ; 1 refs
         RLC     WAVE_R14
         RRC     R12
         RRC     R13
         SUB     R11, R13
         SBC     R10, R12
-        JR      NC, .L_0477
+        JR      NC, .div_bit4
         ADD     R11, R13
         ADC     R10, R12
-.L_0477:                                ; called from: .L_0467($0471)
+.div_bit4:                                ; 1 refs
         RLC     WAVE_R14
         RRC     R12
         RRC     R13
         SUB     R11, R13
         SBC     R10, R12
-        JR      NC, .L_0487
+        JR      NC, .div_bit5
         ADD     R11, R13
         ADC     R10, R12
-.L_0487:                                ; called from: .L_0477($0481)
+.div_bit5:                                ; 1 refs
         RLC     WAVE_R14
         RRC     R12
         RRC     R13
         SUB     R11, R13
         SBC     R10, R12
-        JR      NC, .L_0497
+        JR      NC, .div_bit6
         ADD     R11, R13
         ADC     R10, R12
-.L_0497:                                ; called from: .L_0487($0491)
+.div_bit6:                                ; 1 refs
         RLC     WAVE_R14
         RRC     R12
         RRC     R13
         SUB     R11, R13
         SBC     R10, R12
-        JR      NC, .L_04A7
+        JR      NC, .div_bit7
         ADD     R11, R13
         ADC     R10, R12
-.L_04A7:                                ; called from: .L_0497($04A1)
+.div_bit7:                                ; 1 refs
         RLC     WAVE_R14
         RRC     R12
         RRC     R13
         SUB     R11, R13
         SBC     R10, R12
-        JR      NC, .L_04B7
+        JR      NC, .div_done
         ADD     R11, R13
         ADC     R10, R12
-.L_04B7:                                ; called from: .L_04A7($04B1)
-        RLC     WAVE_R14
-        COM     WAVE_R14
-        LD      R13, #3Eh
-        LD      41h(R13), WAVE_R14
-        LDE     R12, @RR4
-        SUB     WAVE_R14, R12
-        DEC     MICRO_OP
-.L_04C6:
-        LDE     R12, @RR4
+.div_done:                                ; 1 refs
+        RLC     WAVE_R14                        ; last RLC R14 (8th quotient bit)
+        COM     WAVE_R14                        ; COM R14 → complement quotient (invert all bits)
+        LD      R13, #3Eh                       ; R13 = $3E (index for reg[$7F] = $41 + $3E)
+        LD      41h(R13), WAVE_R14              ; reg[$7F] = R14 (store wrap-boundary value at end of wavetable)
+        LDE     R12, @RR4                       ; R12 = next sample from sram (read via RR4, R5 decrements)
+        SUB     WAVE_R14, R12                   ; R14 -= R12 (delta = wrap_value - sample)
+        DEC     MICRO_OP                        ; DEC R5 (advance source pointer backward)
+.fill_loop:                                ; 1 refs
+        LDE     R12, @RR4                       ; fill loop: R12 = sram sample
+        ADD     R12, WAVE_R14                   ; R12 += R14 (add delta offset to sample)
+        LD      40h(R13), R12                   ; reg[$40+R13] = R12 (store in wavetable)
+        DEC     MICRO_OP                        ; DEC R5 (next source sample)
+        DJNZ    R13, .fill_loop                 ; DJNZ R13 → loop until reg[$41] filled
+        LDE     R12, @RR4                       ; last sample for reg[$40]
         ADD     R12, WAVE_R14
         LD      40h(R13), R12
-        DEC     MICRO_OP
-        DJNZ    R13, .L_04C6
-        LDE     R12, @RR4
-        ADD     R12, WAVE_R14
-        LD      40h(R13), R12
-        LD      R10, #10h
-        JP      synthesis_loop_entry
+        LD      R10, #10h                       ; R10 = $10 (restore slave RAM bank byte for RR10)
+        JP      synthesis_loop_entry            ; → synthesis_loop_entry
 
 ; ============================================================
-; === Mode B — Variable-duty DDS ($CF). MODE bits 5:4 = $00 ($04DD) ===
+; === Mode B setup — waveform load + variable-duty DDS ($CF). MODE bits 5:4 = $00 ($04DD) ===
 ; ============================================================
         ORG     04DDh
 synthesis_mode_b:                                ; 1 refs
+; Mode B waveform loading. Copies samples from slave RAM into reg[$40+].
+; Two paths based on sram[$F7] (R14, here used as temp = sample delta):
+; 
+;   R14 != 0 (delta mode): manual loop copies R15 samples from sram[R11],
+;     subtracting R14 from each sample. Stores at reg[$40+R15] downward.
+;     This creates a DC-offset-removed waveform (R14 = DC bias to remove).
+; 
+;   R14 == 0 (direct mode): uses LDEI sled to bulk-copy R15 samples from
+;     sram[R11] into reg[$40] onward. No per-sample processing.
+; 
+;   sram[$F7]: sample delta / DC offset to subtract (0 = no subtraction)
+;   sram[$F6]: waveform source address in slave RAM
+;   R15 (= reg[$0F], from sram[$F9] via full_setup LDEI): sample count - 1
+; 
+; After loading: falls through to synthesis_loop_entry.
         LD      R11, #0F7h
         LDE     WAVE_R14, @RR10
-        LD      R11, #0F6h
+        LD      R11, #0F6h                      ; R11 = sram[$F6] = waveform source address in slave RAM
         LDE     R11, @RR10
-        CP      WAVE_R14, #00h
-        JR      Z, .L_0502
-        ADD     R11, WAVE_R15
-        LD      R13, WAVE_R15
-.L_04EE:
-        LDE     R12, @RR10
-        SUB     R12, WAVE_R14
-        LD      40h(R13), R12
-        DEC     R11
-        DJNZ    R13, .L_04EE
-        LDE     R12, @RR10
-        SUB     R12, WAVE_R14
-        LD      40h(R13), R12
-        JR      synthesis_loop_entry
-.L_0502:                                ; called from: synthesis_mode_b($04E8)
-        LD      R12, #40h
-        LD      MICRO_OP, #0DDh
+        CP      WAVE_R14, #00h                  ; R14 == 0? (no delta subtraction needed?)
+        JR      Z, .wave_ldei_path              ; R14 == 0 → direct LDEI copy path
+        ADD     R11, WAVE_R15                   ; R11 += R15 → point to end of source (loop copies backward)
+        LD      R13, WAVE_R15                   ; R13 = R15 (loop counter = sample count)
+.wave_copy_loop:                                ; 1 refs
+        LDE     R12, @RR10                      ; R12 = sram[R11] (read one sample from slave RAM)
+        SUB     R12, WAVE_R14                   ; R12 -= R14 (subtract DC offset / delta)
+        LD      40h(R13), R12                   ; reg[$40+R13] = R12 (store processed sample in wavetable area)
+        DEC     R11                             ; DEC R11 (move to previous source byte)
+        DJNZ    R13, .wave_copy_loop            ; DJNZ R13 → loop (R13 counts down, stores at $40+R13...$40+1)
+        LDE     R12, @RR10                      ; last sample: R12 = sram[R11]
+        SUB     R12, WAVE_R14                   ; R12 -= R14
+        LD      40h(R13), R12                   ; reg[$40+0] = R12 (store at reg[$40], completing the table)
+        JR      synthesis_loop_entry            ; → synthesis_loop_entry
+.wave_ldei_path:                                ; 1 refs
+        LD      R12, #40h                       ; direct copy path (R14 == 0): use LDEI sled
+        LD      MICRO_OP, #0DDh                 ; R5 = $DD (end of LDEI sled)
+        SUB     MICRO_OP, WAVE_R15              ; R5 -= R15 * 2 (compute sled entry for R15 bytes)
         SUB     MICRO_OP, WAVE_R15
-        SUB     MICRO_OP, WAVE_R15
-        CALL    @RR4
-        JR      synthesis_loop_entry
+        CALL    @RR4                            ; CALL @RR4 → LDEI sled copies R15 samples: sram[R11+] → reg[$40+]
+        JR      synthesis_loop_entry            ; → synthesis_loop_entry
 
 ; ============================================================
 ; === Mode A — Oversampled wavetable + direct DDS ($20-$C4). MODE bits 5:4 = $20 ($050E) ===
@@ -986,18 +1071,28 @@ synthesis_mode_a:                                ; 1 refs
         CALL    ldei_chain_start
 
 ; ============================================================
-; === Synthesis loop entry ($057B) ===
+; === Synthesis loop entry — CLR ACC, add $1D to PROG_CTR, enter interpreter ($057B) ===
 ; ============================================================
         ORG     057Bh
 synthesis_loop_entry:                                ; 5 refs
+; Synthesis loop entry: reset ACC and loop state, prepare PROG_CTR for interpreter.
+; Called once during setup (from synthesis_mode_a/b/c), NOT on each ECLK.
+; 
+; Key action: ADD PROG_CTR, #$1C (+ INC at interpreter_reentry = +$1D total).
+; This converts the raw start_offset from micro_raw[0] to a register-file address:
+;   Normal programs (offset $02): PROG_CTR = $02 + $1D = $1F → reg[$1F] = first opcode
+;   Library programs (offset $2A): PROG_CTR = $2A + $1D = $47 → finalize_output inits ACC
+; 
+; ACC is CLR'd here ($0000). For library programs, finalize_output overwrites it.
+; For normal programs with LFSR, the first opcode should be LOAD to set ACC base.
         CLR     ACC_HI
-        CLR     ACC_LO
+        CLR     ACC_LO                          ; ACC_LO = 0
         CLR     LOOP1_CTR
         CLR     LOOP2_CTR
         CLR     BLOCK_CTR
-        CLR     ZERO
-        LD      MICRO_OP, #19h
-        ADD     PROG_CTR, #1Ch
+        CLR     ZERO                            ; R4 = 0 (ZERO register, used throughout as constant 0)
+        LD      MICRO_OP, #19h                  ; MICRO_OP = $19 (silence micro-op, placeholder until real synthesis starts)
+        ADD     PROG_CTR, #1Ch                  ; ADD $1C to PROG_CTR (+ INC at $058C = +$1D converts offset to reg address)
 interpreter_reentry:                                ; 39 refs
         INC     PROG_CTR
 
@@ -1029,7 +1124,7 @@ micro_program_interpreter:                                ; 5 refs
         JP      @RR12
 
 ; ============================================================
-; === Outer synth functions ($05BC-$0CA4) ($05BC) ===
+; === ENV=imm ($x1) — load immediate to R8:R9 ($05BC) ===
 ; ============================================================
         ORG     05BCh
 op_load_r8r9:
@@ -1038,53 +1133,103 @@ op_load_r8r9:
         INC     PROG_CTR
         LD      ACC_HI, @PROG_CTR
         JP      finalize_output.entry
+
+; ============================================================
+; === AB=imm ($x2) — load immediate to R16:R17 ($05CA) ===
+; ============================================================
+        ORG     05CAh
 op_load_1617:
         LD      ACC3_LO, @PROG_CTR
         AND     ACC3_LO, #0F0h
         INC     PROG_CTR
         LD      ACC3_HI, @PROG_CTR
         JR      interpreter_reentry
+
+; ============================================================
+; === CD=imm ($x3) — load immediate to R14:R15 ($05D7) ===
+; ============================================================
+        ORG     05D7h
 op_load_1415:
         LD      ACC2_LO, @PROG_CTR
         AND     ACC2_LO, #0F0h
         INC     PROG_CTR
         LD      ACC2_HI, @PROG_CTR
         JR      interpreter_reentry
+
+; ============================================================
+; === ENV=AB ($44) — copy R16:R17 → R8:R9 ($05E4) ===
+; ============================================================
+        ORG     05E4h
 op_copy_1617_to_r8r9:
         LD      ACC_LO, ACC3_LO
         LD      ACC_HI, ACC3_HI
         JP      finalize_output.entry
+
+; ============================================================
+; === ENV=CD ($48) — copy R14:R15 → R8:R9 ($05EB) ===
+; ============================================================
+        ORG     05EBh
 op_copy_1415_to_r8r9:
         LD      ACC_LO, ACC2_LO
         LD      ACC_HI, ACC2_HI
         JP      finalize_output.entry
+
+; ============================================================
+; === AB=ENV ($54) — copy R8:R9 → R16:R17 ($05F2) ===
+; ============================================================
+        ORG     05F2h
 op_store_r8r9_to_1617:
         LD      ACC3_LO, ACC_LO
         LD      ACC3_HI, ACC_HI
         JR      interpreter_reentry
+
+; ============================================================
+; === AB=CD ($4C) — copy R14:R15 → R16:R17 ($05F8) ===
+; ============================================================
+        ORG     05F8h
 op_copy_1415_to_1617:
         LD      ACC3_LO, ACC2_LO
         LD      ACC3_HI, ACC2_HI
         JR      interpreter_reentry
+
+; ============================================================
+; === CD=ENV ($58) — copy R8:R9 → R14:R15 ($0600) ===
+; ============================================================
+        ORG     0600h
 op_store_r8r9_to_1415:
         LD      ACC2_LO, ACC_LO
         LD      ACC2_HI, ACC_HI
         JR      interpreter_reentry
+
+; ============================================================
+; === CD=AB ($5C) — copy R16:R17 → R14:R15 ($0606) ===
+; ============================================================
+        ORG     0606h
 op_copy_1617_to_1415:
         LD      ACC2_LO, ACC3_LO
         LD      ACC2_HI, ACC3_HI
         JP      interpreter_reentry
 
 ; ============================================================
-; === Register pair dispatch ($060F) ===
+; === ENV MEM ($A4) — register pair indirect op on R8:R9 ($060F) ===
 ; ============================================================
         ORG     060Fh
 op_regpair_op_08:
         LD      R12, #08h
         JR      regpair_dispatch_entry
+
+; ============================================================
+; === AB MEM ($A8) — register pair indirect op on R16:R17 ($0613) ===
+; ============================================================
+        ORG     0613h
 op_regpair_op_16:
         LD      R12, #16h
         JR      regpair_dispatch_entry
+
+; ============================================================
+; === CD MEM ($AC) — register pair indirect op on R14:R15 ($0617) ===
+; ============================================================
+        ORG     0617h
 op_regpair_op_14:
         LD      R12, #14h
 regpair_dispatch_entry:                                ; 2 refs
@@ -1133,7 +1278,7 @@ regpair_dispatch_entry:                                ; 2 refs
         JP      interpreter_reentry
 
 ; ============================================================
-; === Add/subtract dispatch functions ($0680) ===
+; === ENV+=imm ($x5) — add immediate to R8:R9 ($0680) ===
 ; ============================================================
         ORG     0680h
 op_add_imm_to_r8r9:
@@ -1143,6 +1288,11 @@ op_add_imm_to_r8r9:
         INC     PROG_CTR
         ADC     ACC_HI, @PROG_CTR
         JP      finalize_output.entry
+
+; ============================================================
+; === AB+=imm ($x6) — add immediate to R16:R17 ($0690) ===
+; ============================================================
+        ORG     0690h
 op_add_imm_to_1617:
         LD      R10, @PROG_CTR
         AND     R10, #0F0h
@@ -1150,6 +1300,11 @@ op_add_imm_to_1617:
         INC     PROG_CTR
         ADC     ACC3_HI, @PROG_CTR
         JP      interpreter_reentry
+
+; ============================================================
+; === CD+=imm ($x7) — add immediate to R14:R15 ($06A1) ===
+; ============================================================
+        ORG     06A1h
 op_add_imm_to_1415:
         LD      R10, @PROG_CTR
         AND     R10, #0F0h
@@ -1157,10 +1312,20 @@ op_add_imm_to_1415:
         INC     PROG_CTR
         ADC     ACC2_HI, @PROG_CTR
         JP      interpreter_reentry
+
+; ============================================================
+; === ENV+=AB ($64) — add R16:R17 to R8:R9 ($06B2) ===
+; ============================================================
+        ORG     06B2h
 op_add_1617_to_r8r9:
         ADD     ACC_LO, ACC3_LO
         ADC     ACC_HI, ACC3_HI
         JP      finalize_output.entry
+
+; ============================================================
+; === ENV+=CD sat ($68) — add R14:R15 to R8:R9, saturate at $FFFF ($06BB) ===
+; ============================================================
+        ORG     06BBh
 op_add_1415_to_r8r9_sat:
         ADD     ACC_LO, ACC2_LO
         ADC     ACC_HI, ACC2_HI
@@ -1168,26 +1333,56 @@ op_add_1415_to_r8r9_sat:
         LD      ACC_LO, #0FFh
         LD      ACC_HI, #0FFh
         JP      finalize_output.entry
+
+; ============================================================
+; === AB+=ENV ($74) — add R8:R9 to R16:R17 ($06CB) ===
+; ============================================================
+        ORG     06CBh
 op_add_r8r9_to_1617:
         ADD     ACC3_LO, ACC_LO
         ADC     ACC3_HI, ACC_HI
         JP      interpreter_reentry
+
+; ============================================================
+; === AB+=CD ($6C) — add R14:R15 to R16:R17 ($06D4) ===
+; ============================================================
+        ORG     06D4h
 op_add_1415_to_1617:
         ADD     ACC3_LO, ACC2_LO
         ADC     ACC3_HI, ACC2_HI
         JP      interpreter_reentry
+
+; ============================================================
+; === CD+=ENV ($78) — add R8:R9 to R14:R15 ($06DD) ===
+; ============================================================
+        ORG     06DDh
 op_add_r8r9_to_1415:
         ADD     ACC2_LO, ACC_LO
         ADC     ACC2_HI, ACC_HI
         JP      interpreter_reentry
+
+; ============================================================
+; === CD+=AB ($7C) — add R16:R17 to R14:R15 ($06E6) ===
+; ============================================================
+        ORG     06E6h
 op_add_1617_to_1415:
         ADD     ACC2_LO, ACC3_LO
         ADC     ACC2_HI, ACC3_HI
         JP      interpreter_reentry
+
+; ============================================================
+; === ENV-=AB ($84) — subtract R16:R17 from R8:R9 ($06EF) ===
+; ============================================================
+        ORG     06EFh
 op_sub_1617_from_r8r9:
         SUB     ACC_LO, ACC3_LO
         SBC     ACC_HI, ACC3_HI
         JP      finalize_output.entry
+
+; ============================================================
+; === ENV-=CD ($88) — subtract R14:R15 from R8:R9, floor at 0 ($06F8) ===
+; ============================================================
+        ORG     06F8h
 op_sub_1415_from_r8r9:
         SUB     ACC_LO, ACC2_LO
         SBC     ACC_HI, ACC2_HI
@@ -1195,25 +1390,45 @@ op_sub_1415_from_r8r9:
         CLR     ACC_LO
         CLR     ACC_HI
         JP      finalize_output.entry
+
+; ============================================================
+; === AB-=ENV ($94) — subtract R8:R9 from R16:R17 ($0708) ===
+; ============================================================
+        ORG     0708h
 op_sub_r8r9_from_1617:
         SUB     ACC3_LO, ACC_LO
         SBC     ACC3_HI, ACC_HI
         JP      interpreter_reentry
+
+; ============================================================
+; === AB-=CD ($8C) — subtract R14:R15 from R16:R17 ($0711) ===
+; ============================================================
+        ORG     0711h
 op_sub_1415_from_1617:
         SUB     ACC3_LO, ACC2_LO
         SBC     ACC3_HI, ACC2_HI
         JP      interpreter_reentry
+
+; ============================================================
+; === CD-=ENV ($98) — subtract R8:R9 from R14:R15 ($071A) ===
+; ============================================================
+        ORG     071Ah
 op_sub_r8r9_from_1415:
         SUB     ACC2_LO, ACC_LO
         SBC     ACC2_HI, ACC_HI
         JP      interpreter_reentry
+
+; ============================================================
+; === CD-=AB ($9C) — subtract R16:R17 from R14:R15 ($0723) ===
+; ============================================================
+        ORG     0723h
 op_sub_1617_from_1415:
         SUB     ACC2_LO, ACC3_LO
         SBC     ACC2_HI, ACC3_HI
         JP      interpreter_reentry
 
 ; ============================================================
-; === Negate + multiply entry points ($072C) ===
+; === ENV*=0.(-A) ($F0) — negate R16_HI then multiply ENV ($072C) ===
 ; ============================================================
         ORG     072Ch
 op_neg16_multiply:
@@ -1222,18 +1437,38 @@ op_neg16_multiply:
         INC     R12
         JR      NZ, multiply_8x16_r8r9
         JP      finalize_output.entry
+
+; ============================================================
+; === ENV*=0.(-C) ($F4) — negate R14_HI then multiply ENV ($0736) ===
+; ============================================================
+        ORG     0736h
 op_neg14_multiply:
         LD      R12, ACC2_HI
         COM     R12
         INC     R12
         JR      NZ, multiply_8x16_r8r9
         JP      finalize_output.entry
+
+; ============================================================
+; === ENV*=0.A ($D0) — multiply ENV by R16_HI (fractional) ($0740) ===
+; ============================================================
+        ORG     0740h
 op_mul_by_16:
         LD      R12, ACC3_HI
         JR      multiply_8x16_r8r9
+
+; ============================================================
+; === ENV*=0.C ($D4) — multiply ENV by R14_HI (fractional) ($0744) ===
+; ============================================================
+        ORG     0744h
 op_mul_by_11:
-        LD      R12, SAVED_HI
+        LD      R12, LFSR_VIB_STATE
         JR      multiply_8x16_r8r9
+
+; ============================================================
+; === ENV*=0.imm ($B4) — multiply ENV by immediate (fractional) ($0748) ===
+; ============================================================
+        ORG     0748h
 op_mul_by_imm:
         INC     PROG_CTR
         LD      R12, @PROG_CTR
@@ -1260,6 +1495,11 @@ multiply_8x16_r8r9:                                ; 5 refs
         LD      ACC_LO, R11
         LD      ACC_HI, R10
         JP      finalize_output.entry
+
+; ============================================================
+; === AB*=0.(-C) ($F8) — negate R14_HI, multiply into R16:R17 ($076C) ===
+; ============================================================
+        ORG     076Ch
 op_neg14_mul_to_1617:
         LD      R12, ACC2_HI                    ; R12 = ACC2_HI (secondary accumulator high)
         COM     R12                             ; negate: two's complement step 1
@@ -1269,9 +1509,19 @@ op_neg14_mul_to_1617:
 .neg14_zero_fallback:
         LD      R12, ACC_HI                     ; FIXME UNREACHABLE without patch: use ACC_HI as fallback coefficient when source is zero
         JR      multiply_to_1617                ; → multiply with ACC_HI instead of negated ACC2_HI
+
+; ============================================================
+; === AB*=0.C ($D8) — multiply R16:R17 by R14_HI (fractional) ($077A) ===
+; ============================================================
+        ORG     077Ah
 op_mul14_to_1617:
         LD      R12, ACC2_HI
         JR      multiply_to_1617
+
+; ============================================================
+; === AB*=0.imm ($B8) — multiply R16:R17 by immediate (fractional) ($077E) ===
+; ============================================================
+        ORG     077Eh
 op_mulimm_to_1617:
         INC     PROG_CTR
         LD      R12, @PROG_CTR
@@ -1293,6 +1543,11 @@ multiply_to_1617:                                ; 3 refs
         LD      ACC3_LO, R11
         LD      ACC3_HI, R10
         JP      interpreter_reentry
+
+; ============================================================
+; === CD*=0.(-A) ($FC) — negate R16_HI, multiply into R14:R15 ($07A4) ===
+; ============================================================
+        ORG     07A4h
 op_neg16_mul_to_1415:
         LD      R12, ACC3_HI                    ; R12 = ACC3_HI (tertiary accumulator high)
         COM     R12                             ; negate: two's complement step 1
@@ -1302,9 +1557,19 @@ op_neg16_mul_to_1415:
 .neg16_zero_fallback:
         LD      R12, ACC_HI                     ; FIXME UNREACHABLE without patch: use ACC_HI as fallback coefficient when source is zero
         JR      multiply_to_1415                ; → multiply with ACC_HI instead of negated ACC3_HI
+
+; ============================================================
+; === CD*=0.C ($DC) — multiply R14:R15 by R14_HI (fractional) ($07B2) ===
+; ============================================================
+        ORG     07B2h
 op_mul14_to_1415:
         LD      R12, ACC2_HI
         JR      multiply_to_1415
+
+; ============================================================
+; === CD*=0.imm ($BC) — multiply R14:R15 by immediate (fractional) ($07B6) ===
+; ============================================================
+        ORG     07B6h
 op_mulimm_to_1415:
         INC     PROG_CTR
         LD      R12, @PROG_CTR
@@ -1326,12 +1591,27 @@ multiply_to_1415:                                ; 3 refs
         LD      ACC2_LO, R11
         LD      ACC2_HI, R10
         JP      interpreter_reentry
+
+; ============================================================
+; === ENV*=1.A ($E0) — multiply ENV by 1+R16_HI ($07DC) ===
+; ============================================================
+        ORG     07DCh
 op_mul16_acc_r8r9:
         LD      R12, ACC3_HI
         JR      multiply_acc_r8r9
+
+; ============================================================
+; === ENV*=1.C ($E4) — multiply ENV by 1+R14_HI ($07E0) ===
+; ============================================================
+        ORG     07E0h
 op_mul14_acc_r8r9:
         LD      R12, ACC2_HI
         JR      multiply_acc_r8r9
+
+; ============================================================
+; === ENV*=1.imm ($C4) — multiply ENV by 1+immediate ($07E4) ===
+; ============================================================
+        ORG     07E4h
 op_mulimm_acc_r8r9:
         INC     PROG_CTR
         LD      R12, @PROG_CTR
@@ -1354,9 +1634,19 @@ multiply_acc_r8r9:                                ; 3 refs
         LD      ACC_LO, #0FFh
         LD      ACC_HI, #0FFh
         JP      finalize_output.entry
+
+; ============================================================
+; === AB*=1.C ($E8) — multiply R16:R17 by 1+R14_HI ($080B) ===
+; ============================================================
+        ORG     080Bh
 op_mul14_acc_1617:
         LD      R12, ACC2_HI
         JR      multiply_acc_core_1617
+
+; ============================================================
+; === AB*=1.imm ($C8) — multiply R16:R17 by 1+immediate ($080F) ===
+; ============================================================
+        ORG     080Fh
 op_mulimm_acc_1617:
         INC     PROG_CTR
         LD      R12, @PROG_CTR
@@ -1379,9 +1669,19 @@ multiply_acc_core_1617:                                ; 1 refs
         LD      ACC3_LO, #0FFh
         LD      ACC3_HI, #0FFh
         JP      interpreter_reentry
+
+; ============================================================
+; === CD*=1.A ($EC) — multiply R14:R15 by 1+R16_HI ($083C) ===
+; ============================================================
+        ORG     083Ch
 op_mul16_acc_1415:
         LD      R12, ACC3_HI
         JR      multiply_acc_core_1415
+
+; ============================================================
+; === CD*=1.imm ($CC) — multiply R14:R15 by 1+immediate ($0840) ===
+; ============================================================
+        ORG     0840h
 op_mulimm_acc_1415:
         INC     PROG_CTR
         LD      R12, @PROG_CTR
@@ -1406,7 +1706,7 @@ multiply_acc_core_1415:                                ; 1 refs
         JP      interpreter_reentry
 
 ; ============================================================
-; === 16x8 multiply variants ($086D) ===
+; === AB=0.imm*(A+B) ($B0) — fractional scale of R16:R17 sum ($086D) ===
 ; ============================================================
         ORG     086Dh
 op_mul_1617_by_imm:
@@ -1434,6 +1734,11 @@ op_mul_1617_by_imm:
         LD      ACC3_HI, #0FFh
         LD      ACC3_LO, #0FFh
         JP      finalize_output.entry
+
+; ============================================================
+; === CD=0.imm*(C+D) ($C0) — fractional scale of R14:R15 sum ($089D) ===
+; ============================================================
+        ORG     089Dh
 op_mul_1415_by_imm:
         INC     PROG_CTR
         LD      R12, @PROG_CTR
@@ -1461,52 +1766,107 @@ op_mul_1415_by_imm:
         JP      finalize_output.entry
 
 ; ============================================================
-; === Comparison + conditional branch ($08CD) ===
+; === IF ENV>imm GOTO ($x9) — signed compare ENV vs immediate ($08CD) ===
 ; ============================================================
         ORG     08CDh
 cmp_s_r8r9_imm:
         LD      R12, #08h
         JR      compare_signed
+
+; ============================================================
+; === IF ENV<imm GOTO ($xD) — unsigned compare ENV vs immediate ($08D1) ===
+; ============================================================
+        ORG     08D1h
 cmp_u_r8r9_imm:
         LD      R12, #08h
         JR      compare_unsigned
+
+; ============================================================
+; === IF AB>imm GOTO ($xA) — signed compare AB vs immediate ($08D5) ===
+; ============================================================
+        ORG     08D5h
 cmp_s_1617_imm:
         LD      R12, #16h
         JR      compare_signed
+
+; ============================================================
+; === IF AB<imm GOTO ($xE) — unsigned compare AB vs immediate ($08D9) ===
+; ============================================================
+        ORG     08D9h
 cmp_u_1617_imm:
         LD      R12, #16h
         JR      compare_unsigned
+
+; ============================================================
+; === IF CD>imm GOTO ($xB) — signed compare CD vs immediate ($08DD) ===
+; ============================================================
+        ORG     08DDh
 cmp_s_1415_imm:
         LD      R12, #14h
         JR      compare_signed
+
+; ============================================================
+; === IF CD<imm GOTO ($xF) — unsigned compare CD vs immediate ($08E1) ===
+; ============================================================
+        ORG     08E1h
 cmp_u_1415_imm:
         LD      R12, #14h
         JR      compare_unsigned
+
+; ============================================================
+; === IF ENV<AB GOTO ($24) — unsigned compare ENV vs AB ($08E5) ===
+; ============================================================
+        ORG     08E5h
 cmp_u_r8r9_1617:
         LD      R10, ACC_HI
         LD      R11, ACC_LO
         LD      R12, #16h
         JR      compare_common
+
+; ============================================================
+; === IF ENV<CD GOTO ($28) — unsigned compare ENV vs CD ($08ED) ===
+; ============================================================
+        ORG     08EDh
 cmp_u_r8r9_1415:
         LD      R10, ACC_HI
         LD      R11, ACC_LO
         LD      R12, #14h
         JR      compare_common
+
+; ============================================================
+; === IF CD<AB GOTO ($2C) — unsigned compare CD vs AB ($08F5) ===
+; ============================================================
+        ORG     08F5h
 cmp_u_1617_1415:
         LD      R10, ACC3_HI
         LD      R11, ACC3_LO
         LD      R12, #14h
         JR      compare_common
+
+; ============================================================
+; === IF ENV>AB GOTO ($34) — unsigned compare AB vs ENV ($08FD) ===
+; ============================================================
+        ORG     08FDh
 cmp_u_1617_r8r9:
         LD      R10, ACC3_HI
         LD      R11, ACC3_LO
         LD      R12, #08h
         JR      compare_common
+
+; ============================================================
+; === IF CD>AB GOTO ($3C) — unsigned compare AB vs CD ($0905) ===
+; ============================================================
+        ORG     0905h
 cmp_u_1415_1617:
         LD      R10, ACC2_HI
         LD      R11, ACC2_LO
         LD      R12, #16h
         JR      compare_common
+
+; ============================================================
+; === IF ENV>CD GOTO ($38) — unsigned compare CD vs ENV ($090D) ===
+; ============================================================
+        ORG     090Dh
 cmp_u_1415_r8r9:
         LD      R10, ACC2_HI
         LD      R11, ACC2_LO
@@ -1556,7 +1916,7 @@ branch_less:                                ; 4 refs
         JP      interpreter_reentry
 
 ; ============================================================
-; === Branch dispatch ($0968) ===
+; === GOTO ($70) — unconditional branch dispatch ($0968) ===
 ; ============================================================
         ORG     0968h
 branch_dispatch:                                ; 3 refs
@@ -1569,7 +1929,7 @@ branch_dispatch:                                ; 3 refs
         JP      Z, interpreter_reentry
 
 ; ============================================================
-; === Computed micro-program jump ($097B) ===
+; === Computed micro-program jump (GOTO with computed target) ($097B) ===
 ; ============================================================
         ORG     097Bh
 op_computed_jump:                                ; 4 refs
@@ -1614,7 +1974,7 @@ op_computed_jump:                                ; 4 refs
         JP      interpreter_reentry
 
 ; ============================================================
-; === Loop control ($09C8-$0A55) ($09C8) ===
+; === LOOP0 N=imm ($04) — primary loop, counter in LOOP1_CTR ($09C8) ===
 ; ============================================================
         ORG     09C8h
 op_loop_primary:
@@ -1631,6 +1991,11 @@ loop_counter_check:                                ; 3 refs
         JR      MI, branch_dispatch
         DEC     LOOP1_CTR
         JR      loop_branch_target
+
+; ============================================================
+; === LOOP1 N=imm ($14) — secondary loop, counter in LOOP2_CTR ($09E3) ===
+; ============================================================
+        ORG     09E3h
 op_loop_secondary:
         INC     PROG_CTR
         CP      LOOP2_CTR, ZERO
@@ -1642,30 +2007,55 @@ loop_reload_check:                                ; 3 refs
         JP      MI, branch_dispatch
         DEC     LOOP2_CTR
         JR      loop_branch_target
+
+; ============================================================
+; === LOOP0 N=A ($08) — primary loop, count from R16_HI ($09F9) ===
+; ============================================================
+        ORG     09F9h
 op_loop_reload_18_from_16:
         CP      LOOP1_CTR, ZERO
         JR      NZ, loop_counter_check
         LD      LOOP1_CTR, ACC3_HI
         CP      LOOP1_CTR, ZERO
         JR      loop_branch_target
+
+; ============================================================
+; === LOOP1 N=A ($18) — secondary loop, count from R16_HI ($0A06) ===
+; ============================================================
+        ORG     0A06h
 op_loop_reload_19_from_16:
         CP      LOOP2_CTR, ZERO
         JR      NZ, loop_reload_check
         LD      LOOP2_CTR, ACC3_HI
         CP      LOOP2_CTR, ZERO
         JR      loop_branch_target
+
+; ============================================================
+; === LOOP0 N=C ($0C) — primary loop, count from R14_HI ($0A13) ===
+; ============================================================
+        ORG     0A13h
 op_loop_reload_18_from_14:
         CP      LOOP1_CTR, ZERO
         JR      NZ, loop_counter_check
         LD      LOOP1_CTR, ACC2_HI
         CP      LOOP1_CTR, ZERO
         JR      loop_branch_target
+
+; ============================================================
+; === LOOP1 N=C ($1C) — secondary loop, count from R14_HI ($0A20) ===
+; ============================================================
+        ORG     0A20h
 op_loop_reload_19_from_14:
         CP      LOOP2_CTR, ZERO
         JR      NZ, loop_reload_check
         LD      LOOP2_CTR, ACC2_HI
         CP      LOOP2_CTR, ZERO
         JR      loop_branch_target
+
+; ============================================================
+; === WAIT ($00) — conditional counter / timed delay ($0A2D) ===
+; ============================================================
+        ORG     0A2Dh
 op_conditional_counter:
         INC     PROG_CTR
         CP      @PROG_CTR, #00h
@@ -1687,6 +2077,11 @@ op_conditional_counter:
         OR      0FCh, #02h                      ; 0FC=FLAGS (flags register)
         DEC     PROG_CTR
         JP      init_srp
+
+; ============================================================
+; === EXCHG AB CD ($60) — swap R14:R15 ↔ R16:R17 ($0A58) ===
+; ============================================================
+        ORG     0A58h
 op_swap_1415_1617:
         LD      R10, ACC3_LO
         LD      ACC3_LO, ACC2_LO
@@ -1697,7 +2092,7 @@ op_swap_1415_1617:
         JP      interpreter_reentry
 
 ; ============================================================
-; === Negate reg[$16:$17] ($0A69) ===
+; === AB=-AB ($40) — negate R16:R17 (two's complement) ($0A69) ===
 ; ============================================================
         ORG     0A69h
 op_neg_1617:
@@ -1705,50 +2100,88 @@ op_neg_1617:
         COM     ACC3_LO
         INCW    ACC3_HI
         JP      interpreter_reentry
+
+; ============================================================
+; === CD=-CD ($50) — negate R14:R15 (two's complement) ($0A72) ===
+; ============================================================
+        ORG     0A72h
 op_neg_1415:
         COM     ACC2_HI
         COM     ACC2_LO
         INCW    ACC2_HI
         JP      interpreter_reentry
-op_wavetable_acc:
+
+; ============================================================
+; === STDLINEAR ($A0) — 6-stage linear envelope, 21-byte instruction ($0A7B) ===
+; ============================================================
+        ORG     0A7Bh
+op_stdlinear:
+; STDLINEAR: 6-stage linear envelope with final hold value.
+; Opcode $A0, 21 bytes total. Each ECLK tick, adds a step to ACC
+; for the current stage's duration, then advances to the next stage.
+; 
+; Instruction layout (21 bytes, PROG_CTR points to byte[0] = $A0):
+;   byte[0]:     $A0 opcode
+;   byte[1-3]:   stage 1 {step_hi, step_lo, duration}
+;   byte[4-6]:   stage 2 {step_hi, step_lo, duration}
+;   byte[7-9]:   stage 3 {step_hi, step_lo, duration}
+;   byte[10-12]: stage 4 {step_hi, step_lo, duration}
+;   byte[13-15]: stage 5 {step_hi, step_lo, duration}
+;   byte[16-18]: stage 6 {step_hi, step_lo, duration}
+;   byte[19-20]: final value {acc_hi, acc_lo} (loaded when all stages complete)
+; 
+; Per-stage execution (each ECLK tick):
+;   1. R10 = PROG_CTR + BLOCK_CTR → points to current stage's duration byte
+;   2. If LOOP1_CTR > 0: DEC LOOP1_CTR, ACC += step (from bytes before duration)
+;   3. If LOOP1_CTR == 0: load duration from @R10, check for stage advance
+;   4. If LOOP1_CTR < 0 (bit 7 set = $80): sustain — hold forever at multiply
+; 
+; Stage advance: BLOCK_CTR += 3, advance to next stage. If BLOCK_CTR > $12 (18)
+;   → all 6 stages done: load final ACC from bytes[19:20], clear counters,
+;   advance PROG_CTR past 21 bytes, continue to next opcode.
+; 
+; BLOCK_CTR persists between ECLK ticks (tracks current stage).
+; LOOP1_CTR persists (counts down within a stage).
+; Both are cleared by update_path on each RAUD — so stages restart from 1.
         LD      R10, PROG_CTR
-        CP      BLOCK_CTR, ZERO
-        JR      NZ, .L_0A85
-        LD      BLOCK_CTR, #03h
-.L_0A85:                                ; called from: op_wavetable_acc($0A80)
-        ADD     R10, BLOCK_CTR
+        CP      BLOCK_CTR, ZERO                 ; BLOCK_CTR == 0? (first call or after RAUD reset)
+        JR      NZ, .stage_resume               ; not first → use existing BLOCK_CTR (resume current stage)
+        LD      BLOCK_CTR, #03h                 ; first call: BLOCK_CTR = 3 (point to stage 1 duration)
+.stage_resume:                                ; 1 refs
+        ADD     R10, BLOCK_CTR                  ; R10 = PROG_CTR + BLOCK_CTR → current stage's duration byte
+        CP      LOOP1_CTR, ZERO                 ; LOOP1_CTR == 0? (need to load new stage?)
+        JR      NZ, .check_sustain              ; LOOP1_CTR != 0 → check sign and continue current stage
+.load_duration:                                ; 1 refs
+        LD      LOOP1_CTR, @R10                 ; load duration: LOOP1_CTR = @R10 (stage's duration byte)
         CP      LOOP1_CTR, ZERO
-        JR      NZ, .L_0A95
-.L_0A8D:                                ; called from: .L_0AA7($0AB0)
-        LD      LOOP1_CTR, @R10
-        CP      LOOP1_CTR, ZERO
-        JR      .L_0A9A
-.L_0A95:                                ; called from: .L_0A85($0A8B)
-        JP      MI, finalize_output.multiply
-        DEC     LOOP1_CTR
-.L_0A9A:                                ; called from: .L_0A8D($0A93)
-        JR      Z, .L_0AA7
-        DEC     R10
-        ADD     ACC_LO, @R10
-        DEC     R10
-        ADC     ACC_HI, @R10
-        JP      finalize_output.multiply
-.L_0AA7:                                ; called from: .L_0A9A($0A9A)
-        ADD     BLOCK_CTR, #03h
+        JR      .check_done                     ; jump to zero-check (skip the MI/DEC path)
+.check_sustain:                                ; 1 refs
+        JP      MI, finalize_output.multiply    ; LOOP1_CTR < 0 (bit 7 set) → sustain: hold at multiply forever
+        DEC     LOOP1_CTR                       ; DEC LOOP1_CTR (count down one ECLK tick)
+.check_done:                                ; 1 refs
+        JR      Z, .advance_stage               ; LOOP1_CTR == 0 after DEC or load? → advance to next stage
+        DEC     R10                             ; DEC R10 → points to step_lo
+        ADD     ACC_LO, @R10                    ; ACC_LO += step_lo
+        DEC     R10                             ; DEC R10 → points to step_hi
+        ADC     ACC_HI, @R10                    ; ACC_HI += step_hi (with carry from step_lo add)
+        JP      finalize_output.multiply        ; → multiply with updated ACC
+.advance_stage:                                ; 1 refs
+        ADD     BLOCK_CTR, #03h                 ; advance to next stage: BLOCK_CTR += 3, R10 += 3
         ADD     R10, #03h
-        CP      BLOCK_CTR, #12h
-        JR      ULE, .L_0A8D
-        LD      PROG_CTR, R10
-        DEC     R10
+        CP      BLOCK_CTR, #12h                 ; BLOCK_CTR <= $12 (18)? → more stages remain, loop back
+        JR      ULE, .load_duration
+.all_stages_done:
+        LD      PROG_CTR, R10                   ; all 6 stages done: PROG_CTR = R10 (advance past 21-byte instruction)
+        DEC     R10                             ; load final ACC value from bytes[19:20]
         LD      ACC_LO, @R10
         DEC     R10
         LD      ACC_HI, @R10
-        CLR     BLOCK_CTR
+        CLR     BLOCK_CTR                       ; clear BLOCK_CTR and LOOP1_CTR (envelope complete)
         CLR     LOOP1_CTR
-        JP      finalize_output.multiply
+        JP      finalize_output.multiply        ; → multiply with final ACC value
 
 ; ============================================================
-; === Vibrato 1 — alternating coefficient multiply ($80 opcode, 4-byte) ($0AC3) ===
+; === VIBRATO1 ($80) — alternating coefficient multiply, 4-byte ($0AC3) ===
 ; ============================================================
         ORG     0AC3h
 op_vibrato1:
@@ -1781,7 +2214,7 @@ op_vibrato1:
         JP      multiply_acc_r8r9               ; → multiply_acc_r8r9 (R8:R9 += R12 × R8:R9)
 
 ; ============================================================
-; === Vibrato 2 — sine phase modulation ($90 opcode, 4-byte) ($0AF1) ===
+; === VIBRATO2 ($90) — sine phase modulation, 4-byte ($0AF1) ===
 ; ============================================================
         ORG     0AF1h
 op_vibrato2:
@@ -1803,7 +2236,7 @@ op_vibrato2:
         JP      Z, finalize_output.multiply     ; loop count == 0 → skip
 .vib2_save_r9:
         LD      @R10, ACC_LO                    ; save R9 to FREQ[1] (overwrite loop count with ACC_LO)
-        LD      SAVED_HI, ACC_HI                ; save R8 to SAVED_HI (reg[$11])
+        LD      LFSR_VIB_STATE, ACC_HI          ; save R8 to LFSR_VIB_STATE (reg[$11])
         INC     R10
         LD      LOOP2_CTR, @R10                 ; reg[$19] = FREQ[2] (phase increment)
         CLR     LOOP1_CTR
@@ -1865,7 +2298,7 @@ op_vibrato2:
 .vib2_exit:                                ; 2 refs
         INC     PROG_CTR                        ; add saved ACC offset: R8:R9 += saved values
         ADD     ACC_LO, @PROG_CTR
-        ADC     ACC_HI, SAVED_HI
+        ADC     ACC_HI, LFSR_VIB_STATE
         DEC     PROG_CTR
         JP      finalize_output.multiply        ; → finalize_output.multiply
 .vib2_clr_r8:                                ; 1 refs
@@ -1874,7 +2307,7 @@ op_vibrato2:
         JR      .vib2_exit
 
 ; ============================================================
-; === LFSR pitch modulation source (16-bit PRNG + envelope S&H) ($0B94) ===
+; === NOISE ($10) — 16-bit Galois LFSR pitch modulation, 4-byte ($0B94) ===
 ; ============================================================
         ORG     0B94h
 op_lfsr_noise:
@@ -1903,10 +2336,10 @@ op_lfsr_noise:
 .full_lfsr_step:                                ; 1 refs
         ADD     R10, #03h                       ; point to LFSR low byte (FREQ[3])
         RLC     @R10                            ; rotate low byte left (16-bit LFSR shift)
-        RLC     SAVED_HI                        ; rotate high byte left (carry chain from low)
+        RLC     LFSR_VIB_STATE                  ; rotate high byte left (carry chain from low)
         JR      NC, .no_feedback                ; carry set → apply feedback polynomial
         XOR     @R10, #87h                      ; XOR low byte with $87 (polynomial feedback)
-        XOR     SAVED_HI, #1Dh                  ; XOR high byte with $1D (polynomial = $1D87)
+        XOR     LFSR_VIB_STATE, #1Dh            ; XOR high byte with $1D (polynomial = $1D87)
 .no_feedback:                                ; 1 refs
         SUB     R10, #03h                       ; restore R10 to instruction base
         OR      0FAh, #02h                      ; 0FA=IRQ (interrupt request)  ; set IRQ1 pending (software flag) → forces synthesis_output on next reentry poll
@@ -1916,8 +2349,8 @@ op_lfsr_noise:
         LD      R13, PORT1                      ; R13 = Port 1 (pitch envelope from master COP)
         TCM     PORT2, #04h                     ; re-check bus (may have changed during read)
         JR      NZ, .coeff_exit                 ; bus changed → discard
-        TCM     MODE, #80h                      ; mode bit 7 = fixed formant? (skip pitch envelope update)
-        JR      NZ, .coeff_exit                 ; fixed formant → skip pitch envelope update
+        TCM     MODE, #80h                      ; MODE bit 7: pitch envelope enable? (same test as update_path/$034C)
+        JR      NZ, .coeff_exit                 ; bit 7 CLEAR → no pitch tracking, skip PITCH_ENV/EXSLA update
         LD      PITCH_ENV, R13                  ; reg[$1A] = pitch envelope value (modulation depth)
         SWAP    R12                             ; extract EXSLA routing from Port 3
         RL      R12
@@ -1927,9 +2360,9 @@ op_lfsr_noise:
         JR      .coeff_exit
 .short_lfsr:                                ; 1 refs
         RCF
-        RLC     SAVED_HI
+        RLC     LFSR_VIB_STATE
         JR      NC, .coeff_exit                 ; carry → XOR with $1D (8-bit feedback)
-        XOR     SAVED_HI, #1Dh
+        XOR     LFSR_VIB_STATE, #1Dh
 .coeff_exit:                                ; 5 refs
         LD      R11, 02h(R10)                   ; R11 = FREQ[2] (multiply coefficient)
         LD      R12, #08h                       ; 8-bit multiply loop counter
@@ -1937,7 +2370,7 @@ op_lfsr_noise:
 .mul_loop:                                ; 1 refs
         RR      R11                             ; shift coefficient right
         JR      NC, .mul_skip                   ; bit clear → skip add
-        ADD     R13, SAVED_HI                   ; accumulate: R13 += LFSR high byte (reg[$11])
+        ADD     R13, LFSR_VIB_STATE             ; accumulate: R13 += LFSR high byte (reg[$11])
 .mul_skip:                                ; 1 refs
         RRC     R13                             ; shift result right
         DJNZ    R12, .mul_loop                  ; loop 8 times
@@ -1973,14 +2406,14 @@ op_lfsr_noise:
         JP      finalize_output.multiply        ; → finalize_output.multiply (12×16 multiply with coefficient)
 
 ; ============================================================
-; === LFSR step + multiply → reg[$16:$17] ($0C41) ===
+; === AB=NOISE X=imm ($20) — LFSR step + multiply → R16:R17 ($0C41) ===
 ; ============================================================
         ORG     0C41h
 op_lfsr_mul_1617:
         RCF
-        RLC     SAVED_HI
+        RLC     LFSR_VIB_STATE
         JR      NC, .L_0C49
-        XOR     SAVED_HI, #1Dh
+        XOR     LFSR_VIB_STATE, #1Dh
 .L_0C49:                                ; called from: op_lfsr_mul_1617($0C44)
         INC     PROG_CTR
         LD      R10, @PROG_CTR
@@ -1989,7 +2422,7 @@ op_lfsr_mul_1617:
         CLR     ACC3_HI
         CLR     ACC3_LO
 .L_0C56:                                ; called from: .L_0C60($0C64)
-        RR      SAVED_HI
+        RR      LFSR_VIB_STATE
         JR      NC, .L_0C60
         ADD     ACC3_LO, R11
         ADC     ACC3_HI, R10
@@ -2004,14 +2437,14 @@ op_lfsr_mul_1617:
         JP      interpreter_reentry
 
 ; ============================================================
-; === LFSR step + multiply → reg[$14:$15] ($0C73) ===
+; === CD=NOISE X=imm ($30) — LFSR step + multiply → R14:R15 ($0C73) ===
 ; ============================================================
         ORG     0C73h
 op_lfsr_mul_1415:
         RCF
-        RLC     SAVED_HI
+        RLC     LFSR_VIB_STATE
         JR      NC, .L_0C7B
-        XOR     SAVED_HI, #1Dh
+        XOR     LFSR_VIB_STATE, #1Dh
 .L_0C7B:                                ; called from: op_lfsr_mul_1415($0C76)
         INC     PROG_CTR
         LD      R10, @PROG_CTR
@@ -2020,7 +2453,7 @@ op_lfsr_mul_1415:
         CLR     ACC2_HI
         CLR     ACC2_LO
 .L_0C88:                                ; called from: .L_0C92($0C96)
-        RR      SAVED_HI
+        RR      LFSR_VIB_STATE
         JR      NC, .L_0C92
         ADD     ACC2_LO, R11
         ADC     ACC2_HI, R10
@@ -2035,31 +2468,61 @@ op_lfsr_mul_1415:
         JP      interpreter_reentry
 
 ; ============================================================
-; === Finalize: ACC clamp + 12x12 unsigned multiply + pitch envelope + pitch output ($0CA5) ===
+; === ACC library init + 12x12 unsigned multiply + pitch envelope + pitch output ($0CA5) ===
 ; ============================================================
         ORG     0CA5h
 finalize_output:                                ; 1 refs
-        JR      Z, finalize_output.multiply     ; called by micro_program_interpreter
-        CP      PROG_CTR, #43h
-        JR      UGT, .finalize_sub43_check
-        JR      Z, .L_0CB2
-        LD      ACC_HI, #2Dh
+; ACC initializer — implements mk1 FREQ library programs.
+; Called by micro_program_interpreter when PROG_CTR >= $3D.
+; 
+; How it works: micro_raw[0] (start_offset byte in FREQ block) serves as
+; both a program offset AND a library address. synthesis_loop_entry adds $1C
+; to PROG_CTR, then interpreter_reentry adds 1 more (total +$1D). When
+; start_offset >= $20, the result is >= $3D, routing here instead of executing
+; bytecodes. This implements the mk1utils ROM library (mk1envlib.c):
+; 
+;   start_offset | PROG_CTR after +$1D | ACC set to | mk1utils name
+;   $20           | $3D (Z shortcut)    | $0000*     | HALT (no envelope)
+;   $22           | $3F                 | $2D00      | ENV=$2CE4; HALT
+;   $26           | $43                 | $4000      | ENV=$4000; HALT
+;   $2A           | $47                 | $8000      | ENV=$8000; HALT
+;   $2E           | $4B                 | $FFFF      | ENV=$FFFF; HALT
+;   * $20 takes Z shortcut → ACC stays $0000 from synthesis_loop_entry CLR
+; 
+; After setting ACC: PROG_CTR reset to $3D = HALT state. All subsequent
+; interpreter calls hit the Z shortcut and go directly to multiply.
+; 
+; Entry: Z flag from 'CP PROG_CTR, #$3D' in micro_program_interpreter.
+;   Z set (PROG_CTR == $3D): HALT state → skip init, go to multiply.
+;   Z clear (PROG_CTR > $3D): library init → set ACC, reset to $3D.
+; 
+; For normal programs (start_offset=$02): PROG_CTR = $02 + $1D = $1F,
+; below $3D → interpreter fetches opcodes from reg[$1F] normally.
+; 
+; The LFSR noise handler (op_lfsr_noise) at $0C3E jumps directly to
+; finalize_output.multiply, bypassing this path. LFSR voices use real
+; programs (offset $02) with explicit LOAD opcodes to set ACC.
+        JR      Z, finalize_output.multiply
+        CP      PROG_CTR, #43h                  ; which library entry? compare PROG_CTR to thresholds
+        JR      UGT, .finalize_sub43_check      ; PROG_CTR > $43 → check upper range ($2A/$2E entries)
+        JR      Z, .L_0CB2                      ; PROG_CTR == $43: library $26 (ENV=$4000)
+        LD      ACC_HI, #2Dh                    ; PROG_CTR < $43: library $22 (ENV=$2D00 ≈ $2CE4)
         JR      .finalize_check
 .L_0CB2:                                ; called from: finalize_output($0CAC)
-        LD      ACC_HI, #40h
+        LD      ACC_HI, #40h                    ; library $26: ACC = $4000 (quarter range)
         JR      .finalize_check
 .finalize_sub43_check:                                ; 1 refs
-        CP      PROG_CTR, #4Bh
-        JR      NC, .finalize_clamp_max
-        LD      ACC_HI, #80h
+        CP      PROG_CTR, #4Bh                  ; check if PROG_CTR >= $4B (library $2E)
+        JR      NC, .finalize_clamp_max         ; PROG_CTR >= $4B → library $2E (ENV=$FFFF)
+        LD      ACC_HI, #80h                    ; library $2A: ACC = $8000 (center — standard for noise voices)
 .finalize_check:                                ; 2 refs
-        CLR     ACC_LO
+        CLR     ACC_LO                          ; clear low byte (ACC = ACC_HI:$00)
         JR      .finalize_reset_counter
 .finalize_clamp_max:                                ; 1 refs
-        LD      ACC_HI, #0FFh
+        LD      ACC_HI, #0FFh                   ; library $2E: ACC = $FFFF (maximum)
         LD      ACC_LO, #0FFh
 .finalize_reset_counter:                                ; 1 refs
-        LD      PROG_CTR, #3Dh
+        LD      PROG_CTR, #3Dh                  ; PROG_CTR = $3D → HALT state (library program done, just multiply from now on)
         JR      finalize_output.multiply
 finalize_output.entry:                                ; 20 refs
         INC     PROG_CTR
@@ -2280,15 +2743,21 @@ finalize_output.pitch_output.underflow_shift_entry:                             
         ADD     R12, R13                        ; R12 = 1 + (sub + mode_offset)
         RL      R13                             ; R13 = (sub + mode_offset) * 2
         ADD     R13, R12                        ; R13 = (sub+mode_offset)*2 + 1 + (sub+mode_offset) = (sub+mode_offset)*3 + 1
-.f2_special_check:
-        CP      MICRO_OP_NEXT, #0F2h            ; $F2 DDS amplitude gate: check if waveform exceeds threshold
-        JR      NZ, synthesis_loop_reentry      ; not $F2 → synthesis_loop_reentry with R13 = (sub+mode)*3+1
-        LD      R12, #01h                       ; re-read param table entry (R12=\$01, R13 from pitch_output)
-        LDC     R12, @RR12                      ; R12 = ROM byte (threshold for $F2 gate)
-        RL      R12                             ; threshold × 2
-        CP      R12, WAVE_R15                   ; compare threshold against WAVE_R15 - $F2 does not modify WAVE_R15, it is a loop marker
-        JR      C, synthesis_loop_reentry       ; waveform < threshold → normal (keep running)
-        LD      R13, #2Eh                       ; waveform >= threshold → force silence: R13=\$2E = Mode C sub=15 (T=\$00, op=micro_init)
+.f2_nyquist_gate:
+; Anti-aliasing gate for Mode C ($F2 wrap DDS).
+; T byte (param table byte0) is the phase increment (→ R14).
+; If T*2 >= R15 (wrap point), the DDS completes a cycle in < 2 ticks
+; — above Nyquist. Gate forces silence to prevent aliased noise.
+; The frequency envelope can push pitch up until this gate fires,
+; acting as an automatic upper-frequency cutoff.
+        CP      MICRO_OP_NEXT, #0F2h
+        JR      NZ, synthesis_loop_reentry      ; not $F2 → skip gate (only Mode C needs this check)
+        LD      R12, #01h                       ; R12 = $01 (ROM high byte for param table at $01xx)
+        LDC     R12, @RR12                      ; R12 = ROM[$01:R13] = T byte = phase step for new sub-mode
+        RL      R12                             ; RL R12 → T * 2 (phase advance in 2 IRQ4 ticks)
+        CP      R12, WAVE_R15                   ; T*2 vs R15: C set if T*2 < R15 (at least 2 samples/cycle)
+        JR      C, synthesis_loop_reentry       ; T*2 < R15 → below Nyquist, normal operation
+        LD      R13, #2Eh                       ; T*2 >= R15 → above Nyquist! R13=$2E = silence (Mode C sub=15, op=$19)
 
 ; ============================================================
 ; === Synthesis loop re-entry (ECLK poll). R13 = param table index for synthesis_output (byte0 offset). Set by pitch_output or synthesis_pass_done ($0E2A) ===
@@ -2308,7 +2777,7 @@ synthesis_loop_reentry:                                ; 7 refs
         LD      R12, PORT1                      ; read Port 1 = pitch envelope from master COP
         TCM     PORT2, #04h                     ; re-check bus (may have changed during Port 1 read)
         JR      NZ, synthesis_loop_reentry      ; bus changed → restart (discard both EXSLA and pitch)
-        TCM     MODE, #80h                      ; mode bit 7 = fixed formant? (skip pitch envelope update)
+        TCM     MODE, #80h                      ; MODE bit 7: pitch envelope enable? (bit 7 CLEAR = no pitch tracking)
         JR      NZ, synthesis_loop_reentry      ; override set → restart (don't update pitch envelope)
         LD      PITCH_ENV, R12                  ; commit: store pitch envelope (bus verified stable)
         LD      R12, PITCH_HI                   ; stage 2: promote EXSLA from bits 5:4 to final bits 7:6
@@ -2573,15 +3042,15 @@ finalize_output.underflow_shift:                                ; 2 refs
         NOP
         NOP
         NOP
-        JP      init
+        JP      init_full
         NOP
         NOP
         NOP
-        JP      init
+        JP      init_full
         NOP
         NOP
         NOP
-        JP      init
+        JP      init_full
 
 ; === Quarter-sine scaling LUT ===
         ORG     0FC0h
