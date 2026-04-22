@@ -1298,7 +1298,7 @@ micro-program opcodes are loaded from the FREQ block via slave RAM.
 ### 8.3 Quarter-Wave Sine Table ($0FC0-$0FFF)
 
 64 entries: `round(127 × sin(π/2 × (i+1)/64))` for i=0..63.
-Copied to registers $40-$7F for indexed access via `LD Rd, 40h(Rs)`.
+Used for Vibrato 2 op.
 
 ```
 $0FC0:  3   6   9  12  16  19  22  25  28  31  34  37  40  43  46  49
